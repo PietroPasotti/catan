@@ -13,7 +13,8 @@ def tempo():
         "/home/pietro/canonical/tempo-k8s",
         patches=[
             patch("charm.KubernetesServicePatch")
-        ]
+        ],
+        name='tempo'
     )
     yield tempo
 
@@ -58,7 +59,8 @@ def traefik():
         "/home/pietro/canonical/traefik-k8s-operator",
         patches=[
             patch("charm.KubernetesServicePatch")
-        ]
+        ],
+        name="traefik"
     )
     yield traefik
 
@@ -127,36 +129,35 @@ def test_queue(tempo, tempo_state,
                traefik, traefik_state):
     tracing_tempo = Relation(
         "tracing",
-
     )
     tracing_traefik = Relation(
         "tracing",
-        local_app_data = {"receivers": '["otlp_grpc"]'}
     )
     ms = ModelState({
         tempo: [
-            tempo_state.replace(leader=True, relations=[tracing_tempo]),
-            tempo_state.replace(leader=False, relations=[tracing_tempo]),
+            tempo_state.replace(leader=True),
+            tempo_state.replace(leader=False),
         ],
-        traefik: [traefik_state.replace(leader=True, relations=[tracing_traefik])]
+        traefik: [traefik_state.replace(leader=True)]
     },
         integrations=[Integration(
-            Binding(tempo, 'tracing', 'tracing'),
-            Binding(traefik, 'tracing', 'tracing'),
+            Binding(tempo, 'tracing', 'tracing', tracing_tempo),
+            Binding(traefik, 'tracing', 'tracing', tracing_traefik),
         )]
     )
     c = Catan()
-    c.queue("update-status", tempo)
+
+    c.queue(tracing_traefik.created_event, traefik)
+
     ms_out = c.settle(ms)
-    emitted_repr = [(e[0].path, e[1].charm.meta['name'], e[2]) for e in c._emitted]
+    emitted_repr = [(e[0].path, e[1]._true_name, e[2]) for e in c._emitted]
     assert emitted_repr == [
-        ("update_status", "tempo-k8s", 0),
-        ("update_status", "tempo-k8s", 1),
+        ("tracing_relation_created", "traefik", 0),
         # tempo notices traefik has published receiver requests
-        ("tracing_relation_changed", "tempo-k8s", 0),
-        ("tracing_relation_changed", "tempo-k8s", 1),
+        ("tracing_relation_changed", "tempo", 0),
+        ("tracing_relation_changed", "tempo", 1),
         # traefik notices tempo has published receiver urls
-        ("tracing_relation_changed", "traefik-k8s", 0),
+        ("tracing_relation_changed", "traefik", 0),
     ]
     traefik_tracing_out = ms_out.unit_states[traefik][0].get_relations('tracing')[0]
     assert traefik_tracing_out.remote_app_data

@@ -75,6 +75,7 @@ class Binding(_DCBase):
     app: App
     endpoint: str
     interface: str
+    relation: Relation
 
 
 @dataclasses.dataclass(frozen=True)
@@ -82,8 +83,8 @@ class Integration(_DCBase):
     binding1: Binding
     binding2: Binding
 
-    def sync(self, c: "Catan", model_state_out: "ModelState", app: "App" = None, unit: int = None,
-             queue:bool=True):
+    def sync(self, c: "Catan", model_state_out: "ModelState", app: "App" = None, unit_id: int = None,
+             queue: bool = True):
         """Sync this integration's bindings and queue any events on Catan."""
 
         def _sync(states_from, states_to, binding_from, binding_to):
@@ -95,7 +96,7 @@ class Integration(_DCBase):
             # If not given, it means we're doing an initial sync (not as a consequence of a
             # specific charm executing) and so any unit will do.
             # this ASSUMES that all input states will be equivalent.
-            master_state = states_from[unit or 0]
+            master_state = states_from[unit_id or 0]
             any_b1_relation = master_state.get_relations(binding_from.endpoint)[0]
 
             # not nice, but inevitable?
@@ -166,20 +167,20 @@ class Catan:
         self._event_queue = []
         self._emitted = []
 
-    def queue(self, event: Union[Event, str], app: App = None, unit: int = None):
+    def queue(self, event: Union[Event, str], app: App = None, unit_id: int = None):
         """Queue an event for emission on an app or a unit."""
         if isinstance(event, str):
             event = Event(event)
-        self._queue(event, app, unit)
+        self._queue(event, app, unit_id)
 
-    def _queue(self, event: Event, app: App, unit: int = None):
-        self._event_queue.append((event, app, unit))
+    def _queue(self, event: Event, app: App, unit_id: int = None):
+        self._event_queue.append((event, app, unit_id))
 
     def _expand_event_queue(self, model_state: ModelState):
-        def _expand(event: Event, app: Optional[App], unit: Optional[int]):
+        def _expand(event: Event, app: Optional[App], unit_id: Optional[int]):
             if app is not None:
-                if unit is not None:
-                    return [(event, app, unit)]
+                if unit_id is not None:
+                    return [(event, app, unit_id)]
                 return [(event, app, unit_) for unit_ in range(len(model_state.unit_states[app]))]
             return chain(_expand(event, app, None) for app in model_state.unit_states)
 
@@ -201,11 +202,12 @@ class Catan:
             logger.info(f"processing iteration {i} ({len(q)} events)...")
 
             for item in q:
-                event, app, unit = item
-                if unit is None:
+                event, app, unit_id = item
+                if unit_id is None:
                     # fire on all units
                     if not model_state.unit_states[app]:
-                        logger.error(f"App {app} has no units. Pass some to ``ModelState.unit_states``.")
+                        logger.error(f"App {app} has no units. "
+                                     f"Pass some to ``ModelState.unit_states``.")
                         continue
 
                     for unit_id in range(app.scale):
@@ -213,8 +215,8 @@ class Catan:
                     ms_in = ms_out
                     continue
 
-                ms_out = self._fire(ms_in, event, app, unit)
-                ms_out_synced = self._delta(ms_in, ms_out, app, unit)
+                ms_out = self._fire(ms_in, event, app, unit_id)
+                ms_out_synced = self._sync(ms_out, app, unit_id)
                 ms_in = ms_out_synced
 
         if i == 0:
@@ -225,7 +227,7 @@ class Catan:
         logger.info(f"converged in {i} iterations")
         return ms_in
 
-    def _run_scenario(self, app: App, unit_state: State, event: Event) -> State:
+    def _run_scenario(self, app: App, unit_id:int, unit_state: State, event: Event) -> State:
         logger.info("running scenario...")
         with Context(
                 app.charm.charm_type,
@@ -234,36 +236,45 @@ class Catan:
                 # of charm_type would incorrectly classify it as a built-in type.
                 meta=app.charm.meta,
                 config=app.charm.config,
-                actions=app.charm.actions
+                actions=app.charm.actions,
+                app_name=app.name,
+                unit_id=unit_id
         ).manager(event, unit_state) as mgr:
             c = mgr.charm
             # debugging breakpoint
             print(c)
             return mgr.run()
 
-    def _fire(self, model_state: ModelState, event: Event, app: App, unit: int) -> ModelState:
-        logger.info(f"firing {event} on {app}:{unit}")
-        self._emitted.append((event, app, unit))
+    def _fire(self, model_state: ModelState, event: Event, app: App, unit_id: int) -> ModelState:
+        logger.info(f"firing {event} on {app}:{unit_id}")
+        self._emitted.append((event, app, unit_id))
         # don't mutate: replace.
         ms_out = model_state.copy()
         units = ms_out.unit_states[app]
-        state_in = units[unit]
-        state_out = self._run_scenario(app, state_in, event)
-        units[unit] = state_out
+        state_in = units[unit_id]
+        state_out = self._run_scenario(app, unit_id, state_in, event)
+        units[unit_id] = state_out
         ms_out.unit_states[app] = units
         return ms_out
 
     def _initial_sync(self, model_state: ModelState) -> ModelState:
-        for i in model_state.integrations:
-            # don't queue any events at this stage, we're just making sure the model is consistent.
-            # todo: we could have a single relation instance to roll out to all units of an app,
-            #  that way we can skip the initial sync.
-            i.sync(self, model_state, queue=False)
-        return model_state
+        def _sync(relation_1: Relation, relation_2: Relation, states: List[State]):
+            # relation = relation_1.replace(remote_app_data=relation_2.local_app_data)
+            return [s.replace(relations=s.relations+[relation_1]) for s in states]
 
-    def _delta(self, model_state_in: ModelState, model_state_out: ModelState, app: App, unit: int):
+        new_states = model_state.unit_states.copy()
+
+        for i in model_state.integrations:
+            b1 = i.binding1
+            b2 = i.binding2
+            new_states[b1.app] = _sync(b1.relation, b2.relation, new_states[b1.app])
+            new_states[b2.app] = _sync(b2.relation, b1.relation, new_states[b2.app])
+
+        return model_state.replace(unit_states=new_states)
+
+    def _sync(self, model_state_out: ModelState, app: App, unit_id: int):
         """Check what has changed between the model states and queue any generated events."""
         # fixme: no model_state_out mutation
         for i in model_state_out.integrations:
-            i.sync(self, model_state_out, app, unit)
+            i.sync(self, model_state_out, app, unit_id)
         return model_state_out
