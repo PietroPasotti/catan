@@ -14,7 +14,7 @@ Scenario operates at the level of the single charm unit execution: **one charm i
 This often means hardcoding that data in the tests, with predictable consequences.
 
 Catan, by contrast, operates at the level of **multiple related units, one cloud admin action** at a time.
-In scenario, you look at what happens if `nginx/0` receives a `foo-relation-departed` event while in state X. In Catan, you look at what happen if, given `nginx/0` is in state X and `mydb/1` is in state Y, what happens if the cloud admin does `juju integrate nginx:foo mydb:bar`.
+In scenario, you look at what happens if `nginx/0` receives a `foo-relation-departed` event while in state X. In Catan, given `nginx/0` is in state X and `mydb/1` is in state Y, you look at what happens if the cloud admin does `juju integrate nginx:foo mydb:bar`.
 
 
 ## Data structures
