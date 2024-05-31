@@ -139,7 +139,7 @@ def test_fixed_sequence_multiple(tempo, tempo_state, traefik, traefik_state):
     e1, e2, e3, e4, e5, e6 = c._event_queue
     assert e1.group == e2.group == e3.group == 0
     assert e4.group == e5.group == e6.group == 1
-    assert [e._index for e in c._event_queue] == [0, 1, 2, 3, 4, 5]
+    assert [e._index for e in c._event_queue] == [3, 4, 5, 6, 7, 8]
 
 
 def test_event_queue_expansion(tempo, tempo_state, traefik, traefik_state):
@@ -250,6 +250,10 @@ def test_disintegrate(tempo, tempo_state, traefik, traefik_state):
         "tracing",
     )
 
+    integration = Integration(
+        Binding(tempo, tracing_tempo),
+        Binding(traefik, tracing_traefik),
+    )
     ms = ModelState(
         {
             tempo: {
@@ -258,29 +262,18 @@ def test_disintegrate(tempo, tempo_state, traefik, traefik_state):
             },
             traefik: {0: traefik_state.replace(leader=True)},
         },
-        integrations=[
-            Integration(
-                Binding(tempo, tracing_tempo),
-                Binding(traefik, tracing_traefik),
-            )
-        ],
+        integrations=[integration],
     )
     c = Catan(ms)
-    c.disintegrate(tempo, "tracing", traefik)
+    c.disintegrate(integration)
     ms_final = c.settle()
 
     assert c._emitted_repr == [
         "tempo/0 :: tracing_relation_departed",
         "tempo/1 :: tracing_relation_departed",
-        "traefik/0 :: tracing_relation_departed",
         "tempo/0 :: tracing_relation_broken",
         "tempo/1 :: tracing_relation_broken",
-        "traefik/0 :: tracing_relation_broken",
-        "tempo/0 :: tracing_relation_departed",
-        "tempo/1 :: tracing_relation_departed",
         "traefik/0 :: tracing_relation_departed",
-        "tempo/0 :: tracing_relation_broken",
-        "tempo/1 :: tracing_relation_broken",
         "traefik/0 :: tracing_relation_broken",
     ]
     assert not ms_final.unit_states[traefik][0].get_relations("tracing")
@@ -373,6 +366,112 @@ def test_add_unit(tempo, tempo_state, traefik, traefik_state):
         "traefik/42 :: leader_settings_changed",
         "traefik/42 :: config_changed",
         "traefik/42 :: start",
+    ]
+
+
+def test_remove_unit(tempo, tempo_state, traefik, traefik_state):
+    ms = ModelState(
+        {
+            tempo: {
+                0: tempo_state.replace(leader=True),
+                1: tempo_state.replace(leader=False),
+            },
+        }
+    )
+    c = Catan(ms)
+
+    c.remove_unit(tempo, 0)
+    ms_out = c.settle()
+
+    assert set(ms_out.unit_states[tempo]) == {1}
+    assert ms_out.unit_states[tempo][1].leader
+
+    c.settle()
+
+    assert c._emitted_repr == [
+        # tempo/1 becomes leader
+        "tempo/1 :: leader_elected",
+        # tempo/0 RIP
+        "tempo/0 :: leader_settings_changed",
+        "tempo/0 :: stop",
+        "tempo/0 :: remove",
+    ]
+
+
+def test_remove_app(tempo, tempo_state, traefik, traefik_state):
+    ms = ModelState(
+        {
+            tempo: {
+                0: tempo_state.replace(leader=True),
+                1: tempo_state.replace(leader=False),
+            },
+        }
+    )
+    c = Catan(ms)
+
+    c.remove_app(tempo)
+    ms_out = c.settle()
+
+    assert tempo not in ms_out.unit_states
+    c.settle()
+
+    assert c._emitted_repr == [
+        # tempo/1 RIP
+        "tempo/1 :: stop",
+        "tempo/1 :: remove",
+        # tempo/0 RIP, leader last
+        "tempo/0 :: stop",
+        "tempo/0 :: remove",
+    ]
+
+
+def test_remove_related_app(tempo, tempo_state, traefik, traefik_state):
+    ms = ModelState(
+        {
+            tempo: {
+                0: tempo_state.replace(leader=True),
+                1: tempo_state.replace(leader=False),
+            },
+            traefik: {0: traefik_state.replace(leader=True)},
+        },
+        integrations=[
+            Integration(
+                Binding(
+                    tempo,
+                    Relation(
+                        "tracing",
+                    ),
+                ),
+                Binding(
+                    traefik,
+                    Relation(
+                        "tracing",
+                    ),
+                ),
+            )
+        ],
+    )
+    c = Catan(ms)
+
+    c.remove_app(tempo)
+    ms_out = c.settle()
+
+    assert tempo not in ms_out.unit_states
+    c.settle()
+
+    assert c._emitted_repr == [
+        "tempo/0 :: tracing_relation_departed",
+        "tempo/1 :: tracing_relation_departed",
+        "tempo/0 :: tracing_relation_broken",
+        "tempo/1 :: tracing_relation_broken",
+        "traefik/0 :: tracing_relation_departed",
+        "traefik/0 :: tracing_relation_broken",
+        # tempo/1 RIP
+        "tempo/1 :: stop",
+        "tempo/1 :: remove",
+        # tempo/0 RIP, leader last
+        "tempo/0 :: stop",
+        "tempo/0 :: remove",
     ]
 
 

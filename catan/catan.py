@@ -4,11 +4,11 @@ import random
 import sys
 from collections import defaultdict
 from contextlib import contextmanager
-from functools import partial
+from functools import partial, singledispatch
 from importlib import import_module
 from itertools import chain, count
 from pathlib import Path
-from typing import Dict, List, Optional, Union, Sequence, Iterable
+from typing import Dict, List, Optional, Union, Sequence, Iterable, Tuple
 
 from ops import CharmBase
 from scenario import *
@@ -94,8 +94,15 @@ class Binding(_DCBase):
 
 @dataclasses.dataclass(frozen=True)
 class Integration(_DCBase):
+    """Juju integration."""
+
     binding1: Binding
     binding2: Binding
+
+    @property
+    def apps(self) -> Tuple[App, App]:
+        """Apps partaking in this integration."""
+        return self.binding1.app, self.binding2.app
 
     def sync(
         self,
@@ -185,6 +192,14 @@ class Integration(_DCBase):
 
 
 @dataclasses.dataclass(frozen=True)
+class _HistoryItem(_DCBase):
+    event: Event
+    app: App
+    unit_id: int
+    state_out: State
+
+
+@dataclasses.dataclass(frozen=True)
 class ModelState(_DCBase):
     unit_states: Dict[App, Dict[int, State]] = dataclasses.field(default_factory=dict)
     """Mapping from apps to the states of their units."""
@@ -215,15 +230,18 @@ class _QueueItem:
 class Catan:
     """Model-level State convergence tool.
 
-    - Settlers of Juju unite!
-
-    - Like scenario, but for multiple charms.
+    Settlers of Juju unite!
+    Like scenario, but for multiple charms.
     """
 
     def __init__(self, model_state: Optional[ModelState] = None):
         self._model_state = model_state or ModelState()
+
+        # used to keep track of states we remove from self._model_state (e.g. with remove_unit)
+        # but we still need in order to be able to scenario the charm.
+        self._dead_unit_states: Dict[App, Dict[int, State]] = defaultdict(dict)
         self._event_queue: List[_QueueItem] = []
-        self._emitted = []
+        self._emitted: List[_HistoryItem] = []
 
         self._fixed_sequence_counter = 0
         self._current_group = None
@@ -253,9 +271,8 @@ class Catan:
         self._event_queue.extend(expanded)
         return expanded
 
-    @staticmethod
     def _expand_queue_item(
-        model_state: ModelState, item: _QueueItem
+        self, model_state: ModelState, item: _QueueItem
     ) -> Iterable[_QueueItem]:
         """Expand the queue item until all elements are explicit."""
 
@@ -268,10 +285,12 @@ class Catan:
             if app is not None:
                 if unit_id is not None:
                     return [qitem]
-                return [
-                    _QueueItem(event, app, unit_, group)
-                    for unit_ in ms.unit_states[app]
-                ]
+                units = (
+                    ms.unit_states[app]
+                    if app in ms.unit_states
+                    else self._dead_unit_states[app]
+                )
+                return [_QueueItem(event, app, unit_, group) for unit_ in units]
             return chain(
                 *(
                     _expand(ms, _QueueItem(event, app, None, group))
@@ -323,6 +342,11 @@ class Catan:
     def _get_next_queue_item(self):
         if self._event_queue:
             return self._event_queue.pop(0)
+
+    @property
+    def emitted(self) -> List[_HistoryItem]:
+        """Inspect all events that have been emitted so far by this Catan."""
+        return self._emitted
 
     def settle(self) -> ModelState:
         """Settle Catan."""
@@ -378,14 +402,30 @@ class Catan:
         self, model_state: ModelState, event: Event, app: App, unit_id: int
     ) -> ModelState:
         logger.info(f"firing {event} on {app}:{unit_id}")
-        self._emitted.append((event, app, unit_id))
         # don't mutate: replace.
         ms_out = model_state.copy()
-        units = ms_out.unit_states[app]
-        state_in = units[unit_id]
+        dead_unit = False
+
+        try:
+            units = ms_out.unit_states[app]
+            state_in = units[unit_id]
+        except KeyError as e:
+            try:
+                state_in = self._dead_unit_states[app][unit_id]
+                dead_unit = True
+            except KeyError:
+                raise RuntimeError(
+                    f"{app}/{unit_id} not found in current model_state or dead_units_states."
+                ) from e
+
         state_out = self._run_scenario(app, unit_id, state_in, event)
-        units[unit_id] = state_out
-        ms_out.unit_states[app] = units
+
+        self._emitted.append(_HistoryItem(event, app, unit_id, state_out))
+
+        if not dead_unit:
+            units[unit_id] = state_out  # noqa
+            ms_out.unit_states[app] = units
+
         return ms_out
 
     @staticmethod
@@ -437,18 +477,37 @@ class Catan:
         self._model_state = ms_out
         return ms_out
 
-    def disintegrate(self, app1: App, endpoint: str, app2: App) -> ModelState:
+    def disintegrate(self, integration: Integration) -> ModelState:
         """Remove an integration."""
+        model_state = self._model_state
+        app1, app2 = integration.apps
+
+        for app, relation in (
+            (app1, integration.binding1.relation),
+            (app2, integration.binding2.relation),
+        ):
+            # todo do this for all <other app> units
+            self._queue(model_state, relation.departed_event, app)
+            self._queue(model_state, relation.broken_event, app)
+
+        ms_out = model_state.replace(
+            integrations=[i for i in model_state.integrations if i is not integration]
+        )
+        self._model_state = ms_out
+        return ms_out
+
+    def get_integration(self, app1: App, endpoint: str, app2: App) -> Integration:
+        """Get an integration."""
         to_remove = None
         ms = self._model_state
 
-        for i, integration in enumerate(ms.integrations):
+        for integration in ms.integrations:
             if (
                 integration.binding1.app == app1
                 and integration.binding2.app == app2
                 and integration.binding1.relation.endpoint == endpoint
             ):
-                to_remove = ms.integrations[i]
+                to_remove = integration
                 break
             if (
                 integration.binding1.app == app2
@@ -456,27 +515,13 @@ class Catan:
                 and integration.binding1.relation.endpoint == endpoint
             ):
                 app1, app2 = app2, app1
-                to_remove = ms.integrations[i]
+                to_remove = integration
                 break
 
         if not to_remove:
-            raise RuntimeError(
-                f"Not found: cannot disintegrate {app1}:{endpoint} --> {app2}"
-            )
+            raise RuntimeError(f"Integration not found: {app1}:{endpoint} --> {app2}")
 
-        for app, relation in (
-            (app1, to_remove.binding1.relation),
-            (app2, to_remove.binding2.relation),
-        ):
-            # todo do this for all <other app> units
-            self._queue(ms, relation.departed_event)
-            self._queue(ms, relation.broken_event)
-
-        ms_out = ms.replace(
-            integrations=[i for i in ms.integrations if i is not to_remove]
-        )
-        self._model_state = ms_out
-        return ms_out
+        return to_remove
 
     def run_action(
         self,
@@ -514,6 +559,21 @@ class Catan:
             self._queue(model_state, "config-changed", app, unit)
             self._queue(model_state, "start", app, unit)
 
+    def queue_teardown_sequence(self, app: App, unit: Optional[int] = None):
+        """Queues teardown phase event sequence for this app/unit."""
+        model_state = self._model_state
+
+        if unit is None:
+            for unit_id in model_state.unit_states[app]:
+                self.queue_teardown_sequence(app, unit_id)
+            return
+
+        with self.fixed_sequence():
+            # todo storage detached events
+            # todo relation broken events
+            self._queue(model_state, "stop", app, unit)
+            self._queue(model_state, "remove", app, unit)
+
     def add_unit(
         self,
         app: App,
@@ -535,6 +595,78 @@ class Catan:
 
         self._model_state = new_model_state
         self.queue_setup_sequence(app, unit)
+        return new_model_state
+
+    def remove_app(self, app: App):
+        """Remove an app."""
+        model_state = self._model_state
+        new_states = model_state.unit_states.copy()
+
+        if app not in new_states:
+            raise RuntimeError(f"app {app} not in ModelState")
+
+        all_unit_states = new_states.pop(app)
+        # in case we've previously killed some units of this app:
+        all_unit_states.update(self._dead_unit_states[app])
+        self._dead_unit_states[app] = all_unit_states
+
+        new_model_state: ModelState = model_state.replace(unit_states=new_states)
+        # set this first so that queue_setup_sequence will use it
+        self._model_state = new_model_state
+
+        for integration in new_model_state.integrations:
+            if app in integration.apps:
+                self.disintegrate(integration)
+
+        # we could call queue_teardown_sequence(app), but depending on who's the leader that might
+        # trigger a lot more events than we'd like. If we're destroying the app there's no point
+        # in electing a new leader each time, so instead we nuke the leader last,
+        # to prevent any bouncing.
+        follower_ids = list(all_unit_states)
+        leader_id = [i for i, s in all_unit_states.items() if s.leader][0]
+        follower_ids.remove(leader_id)
+        for follower_id in follower_ids:
+            self.queue_teardown_sequence(app, follower_id)
+        self.queue_teardown_sequence(app, leader_id)
+
+        return new_model_state
+
+    def remove_unit(self, app: App, unit: int):
+        """Remove an app."""
+        model_state = self._model_state
+        new_states = model_state.unit_states.copy()
+
+        if app not in new_states:
+            raise RuntimeError(f"app {app} not in ModelState")
+
+        unit_state = new_states[app].pop(unit)
+        self._dead_unit_states[app][unit] = unit_state
+
+        new_model_state = model_state.replace(unit_states=new_states)
+
+        if unit_state.leader:
+            # killing the leader!
+            if new_states[app]:
+                new_leader_id = random.choice(list(new_states[app]))
+                logger.debug(
+                    f"killing the leader. Electing {new_leader_id} instead. "
+                    f"Long live {app}/{new_leader_id}!"
+                )
+
+                new_states[app][new_leader_id] = new_states[app][new_leader_id].replace(
+                    leader=True
+                )
+                self._queue(new_model_state, "leader-elected", app, new_leader_id)
+
+            else:
+                logger.debug(f"killing the last unit and leader, {app} scaled to zero.")
+
+            self._queue(new_model_state, "leader-settings-changed", app, unit)
+
+        # set this first so that queue_setup_sequence will use it
+        self._model_state = new_model_state
+        self.queue_teardown_sequence(app, unit)
+
         return new_model_state
 
     def deploy(
@@ -570,7 +702,7 @@ class Catan:
 
     @property
     def _emitted_repr(self):
-        return [f"{e[1].name}/{e[2]} :: {e[0].path}" for e in self._emitted]
+        return [f"{e.app.name}/{e.unit_id} :: {e.event.path}" for e in self._emitted]
 
     def shuffle(self, respect_sequences: bool = True):
         """In-place-shuffle self._event_queue."""
