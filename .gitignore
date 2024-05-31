@@ -1,3 +1,5 @@
 *.pyi
 *.pyc
 .tox
+build
+*.egg-info
