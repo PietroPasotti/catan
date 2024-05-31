@@ -1,6 +1,6 @@
 # Catan
 
-Catan is a **charm elation interface integration testing sdk**.
+Catan is a **charm relation interface integration testing sdk**.
 Let's break it down:
 
 - It's a testing library.
