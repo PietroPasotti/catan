@@ -169,12 +169,6 @@ def test_event_queue_expansion(tempo, tempo_state, traefik, traefik_state):
 
 @pytest.mark.parametrize("traefik_unit_id", (0, 4, 25))
 def test_queue(tempo, tempo_state, traefik, traefik_state, traefik_unit_id):
-    tracing_tempo = Relation(
-        "tracing",
-    )
-    tracing_traefik = Relation(
-        "tracing",
-    )
     ms = ModelState(
         {
             tempo: {
@@ -185,13 +179,13 @@ def test_queue(tempo, tempo_state, traefik, traefik_state, traefik_unit_id):
         },
         integrations=[
             Integration(
-                Binding(tempo, tracing_tempo),
-                Binding(traefik, tracing_traefik),
+                Binding(tempo, "tracing"),
+                Binding(traefik, "tracing"),
             )
         ],
     )
     c = Catan(ms)
-    c.queue(tracing_traefik.created_event, traefik)
+    c.queue(Relation("tracing", remote_app_name="tempo").created_event, traefik)
     ms_out = c.settle()
 
     assert c._emitted_repr == [
@@ -227,12 +221,13 @@ def test_integrate(tempo, tempo_state, traefik, traefik_state):
     assert c._emitted_repr == [
         "tempo/0 :: tracing_relation_created",
         "tempo/1 :: tracing_relation_created",
-        "tempo/0 :: tracing_relation_joined",
-        "tempo/1 :: tracing_relation_joined",
+        "tempo/0 :: tracing_relation_joined(traefik/0)",
+        "tempo/1 :: tracing_relation_joined(traefik/0)",
         "tempo/0 :: tracing_relation_changed",
         "tempo/1 :: tracing_relation_changed",
         "traefik/0 :: tracing_relation_created",
-        "traefik/0 :: tracing_relation_joined",
+        "traefik/0 :: tracing_relation_joined(tempo/0)",
+        "traefik/0 :: tracing_relation_joined(tempo/1)",
         "traefik/0 :: tracing_relation_changed",
         "tempo/0 :: tracing_relation_changed",
         "tempo/1 :: tracing_relation_changed",
@@ -251,8 +246,8 @@ def test_disintegrate(tempo, tempo_state, traefik, traefik_state):
     )
 
     integration = Integration(
-        Binding(tempo, tracing_tempo),
-        Binding(traefik, tracing_traefik),
+        Binding(tempo, "tracing"),
+        Binding(traefik, "tracing"),
     )
     ms = ModelState(
         {
@@ -269,11 +264,12 @@ def test_disintegrate(tempo, tempo_state, traefik, traefik_state):
     ms_final = c.settle()
 
     assert c._emitted_repr == [
-        "tempo/0 :: tracing_relation_departed",
-        "tempo/1 :: tracing_relation_departed",
+        "tempo/0 :: tracing_relation_departed(traefik/0)",
+        "tempo/1 :: tracing_relation_departed(traefik/0)",
         "tempo/0 :: tracing_relation_broken",
         "tempo/1 :: tracing_relation_broken",
-        "traefik/0 :: tracing_relation_departed",
+        "traefik/0 :: tracing_relation_departed(tempo/0)",
+        "traefik/0 :: tracing_relation_departed(tempo/1)",
         "traefik/0 :: tracing_relation_broken",
     ]
     assert not ms_final.unit_states[traefik][0].get_relations("tracing")
@@ -436,18 +432,8 @@ def test_remove_related_app(tempo, tempo_state, traefik, traefik_state):
         },
         integrations=[
             Integration(
-                Binding(
-                    tempo,
-                    Relation(
-                        "tracing",
-                    ),
-                ),
-                Binding(
-                    traefik,
-                    Relation(
-                        "tracing",
-                    ),
-                ),
+                Binding(tempo, "tracing"),
+                Binding(traefik, "tracing"),
             )
         ],
     )
@@ -460,11 +446,12 @@ def test_remove_related_app(tempo, tempo_state, traefik, traefik_state):
     c.settle()
 
     assert c._emitted_repr == [
-        "tempo/0 :: tracing_relation_departed",
-        "tempo/1 :: tracing_relation_departed",
+        "tempo/0 :: tracing_relation_departed(traefik/0)",
+        "tempo/1 :: tracing_relation_departed(traefik/0)",
         "tempo/0 :: tracing_relation_broken",
         "tempo/1 :: tracing_relation_broken",
-        "traefik/0 :: tracing_relation_departed",
+        "traefik/0 :: tracing_relation_departed(tempo/0)",
+        "traefik/0 :: tracing_relation_departed(tempo/1)",
         "traefik/0 :: tracing_relation_broken",
         # tempo/1 RIP
         "tempo/1 :: stop",
@@ -541,20 +528,22 @@ def test_imatrix_fill(tempo, tempo_state, traefik, traefik_state):
     assert c._emitted_repr == [
         "tempo/0 :: tracing_relation_created",
         "tempo/1 :: tracing_relation_created",
-        "tempo/0 :: tracing_relation_joined",
-        "tempo/1 :: tracing_relation_joined",
+        "tempo/0 :: tracing_relation_joined(traefik/0)",
+        "tempo/1 :: tracing_relation_joined(traefik/0)",
         "tempo/0 :: tracing_relation_changed",
         "tempo/1 :: tracing_relation_changed",
         "traefik/0 :: tracing_relation_created",
-        "traefik/0 :: tracing_relation_joined",
+        "traefik/0 :: tracing_relation_joined(tempo/0)",
+        "traefik/0 :: tracing_relation_joined(tempo/1)",
         "traefik/0 :: tracing_relation_changed",
         "traefik/0 :: traefik_route_relation_created",
-        "traefik/0 :: traefik_route_relation_joined",
+        "traefik/0 :: traefik_route_relation_joined(tempo/0)",
+        "traefik/0 :: traefik_route_relation_joined(tempo/1)",
         "traefik/0 :: traefik_route_relation_changed",
         "tempo/0 :: ingress_relation_created",
         "tempo/1 :: ingress_relation_created",
-        "tempo/0 :: ingress_relation_joined",
-        "tempo/1 :: ingress_relation_joined",
+        "tempo/0 :: ingress_relation_joined(traefik/0)",
+        "tempo/1 :: ingress_relation_joined(traefik/0)",
         "tempo/0 :: ingress_relation_changed",
         "tempo/1 :: ingress_relation_changed",
         "tempo/0 :: tracing_relation_changed",
@@ -568,7 +557,10 @@ def test_imatrix_fill(tempo, tempo_state, traefik, traefik_state):
     ingress = c.get_integration(traefik, "traefik-route", tempo)
     tracing = c.get_integration(traefik, "tracing", tempo)
 
-    assert (
-        ms_final.unit_states[traefik][0].get_relations("tracing")[0]
-        is tracing.binding2.relation
+    tempo0_tracing_app_data = (
+        ms_final.unit_states[tempo][0].get_relations("tracing")[0].local_app_data
     )
+    tempo1_tracing_app_data = (
+        ms_final.unit_states[tempo][1].get_relations("tracing")[0].local_app_data
+    )
+    assert tempo0_tracing_app_data == tempo1_tracing_app_data

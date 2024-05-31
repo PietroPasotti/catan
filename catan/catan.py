@@ -89,7 +89,19 @@ class App(_DCBase):
 @dataclasses.dataclass(frozen=True)
 class Binding(_DCBase):
     app: App
-    relation: Relation
+    endpoint: str
+
+    local_app_data: Dict[str, str] = dataclasses.field(default_factory=dict)
+    remote_app_data: Dict[str, str] = dataclasses.field(default_factory=dict)
+    local_units_data: Dict[int, Dict[str, str]] = dataclasses.field(
+        default_factory=dict
+    )
+    remote_units_data: Dict[int, Dict[str, str]] = dataclasses.field(
+        default_factory=dict
+    )
+
+    def __repr__(self):
+        return f"<Binding {self.app.name}:{self.endpoint}>"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -103,6 +115,20 @@ class Integration(_DCBase):
     def apps(self) -> Tuple[App, App]:
         """Apps partaking in this integration."""
         return self.binding1.app, self.binding2.app
+
+    @property
+    def relations(self) -> Tuple[Relation, Relation]:
+        """Relations."""
+        return (
+            Relation(
+                endpoint=self.binding1.endpoint,
+                remote_app_name=self.binding2.app.name,
+            ),
+            Relation(
+                endpoint=self.binding2.endpoint,
+                remote_app_name=self.binding1.app.name,
+            ),
+        )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -284,14 +310,12 @@ class Catan:
                 "Event queue empty: converged in zero iterations. "
                 "Model state unchanged (modulo initial sync)."
             )
-            self._model_state = model_state
-            return model_state
+            return self._final_sync(model_state)
 
         logger.info(f"Catan settled in {i} iterations")
         log = "\t" + "\n\t".join(self._emitted_repr)
         logger.info(f"Emission log: \n {log}")
-        self._model_state = model_state
-        return model_state
+        return self._final_sync(model_state)
 
     @staticmethod
     def _run_scenario(app: App, unit_id: int, unit_state: State, event: Event) -> State:
@@ -345,10 +369,9 @@ class Catan:
     def _initial_sync(self) -> ModelState:
         """Bring the unit states in sync with what's in the Integrations."""
 
-        def _sync(relation_1: Relation, relation_2: Relation, states: Dict[int, State]):
-            # relation = relation_1.replace(remote_app_data=relation_2.local_app_data)
+        def _sync(relation, states: Dict[int, State]):
             return {
-                uid: s.replace(relations=s.relations + [relation_1])
+                uid: s.replace(relations=s.relations + [relation])
                 for uid, s in states.items()
             }
 
@@ -358,8 +381,9 @@ class Catan:
         for i in model_state.integrations:
             b1 = i.binding1
             b2 = i.binding2
-            new_states[b1.app] = _sync(b1.relation, b2.relation, new_states[b1.app])
-            new_states[b2.app] = _sync(b2.relation, b1.relation, new_states[b2.app])
+            r1, r2 = i.relations
+            new_states[b1.app] = _sync(r1, new_states[b1.app])
+            new_states[b2.app] = _sync(r2, new_states[b2.app])
 
         return model_state.replace(unit_states=new_states)
 
@@ -390,15 +414,11 @@ class Catan:
             # specific charm executing) and so any unit will do.
             # this ASSUMES that all input states will be equivalent.
             master_state = states_from[unit_id or 0]
-            any_b1_relation = master_state.get_relations(
-                binding_from.relation.endpoint
-            )[0]
+            any_b1_relation = master_state.get_relations(binding_from.endpoint)[0]
 
             # not nice, but inevitable?
             any_b2_state = next(iter(states_to.values()))
-            any_b2_relation = any_b2_state.get_relations(binding_to.relation.endpoint)[
-                0
-            ]
+            any_b2_relation = any_b2_state.get_relations(binding_to.endpoint)[0]
 
             if any_b1_relation.local_app_data == any_b2_relation.remote_app_data:
                 # no changes!
@@ -424,13 +444,11 @@ class Catan:
             # we replace remote app data with binding_from's local app data.
             any_state_to = next(iter(states_to.values()))
             new_relations_b2 = [
-                r
-                for r in any_state_to.relations
-                if r.endpoint != binding_to.relation.endpoint
+                r for r in any_state_to.relations if r.endpoint != binding_to.endpoint
             ] + [
                 r.replace(remote_app_data=local_app_data)
                 for r in any_state_to.relations
-                if r.endpoint == binding_to.relation.endpoint
+                if r.endpoint == binding_to.endpoint
             ]
             new_states_2 = {
                 uid: unit_state.replace(relations=new_relations_b2)
@@ -456,31 +474,81 @@ class Catan:
         if app is None or app == b2.app:
             _sync(states_out_b2, states_out_b1, b2, b1)
 
-    def _final_sync(self):
-        """Bring the Integrations in sync with what's in model's unit states."""
-        model_state = self._model_state
+    def _final_sync(self, model_state: ModelState):
+        """Bring the Integrations in sync with what's in the model's unit states."""
         new_integrations = []
 
         for i in model_state.integrations:
-            b1 = i.binding1
-            b2 = i.binding2
-            new_integrations.append(i.replace())
+            b1_relations = {}
+            b2_relations = {}
 
-        return model_state.replace(integrations=new_integrations)
+            for unit_id, state in model_state.unit_states[i.binding1.app].items():
+                b1_relations[unit_id] = [
+                    r
+                    for r in state.get_relations(i.binding1.endpoint)
+                    if r.remote_app_name == i.binding2.app.name
+                    # hopefully there's only one in here!
+                ][0]
+
+            for unit_id, state in model_state.unit_states[i.binding2.app].items():
+                b2_relations[unit_id] = [
+                    r
+                    for r in state.get_relations(i.binding2.endpoint)
+                    if r.remote_app_name == i.binding1.app.name
+                    # hopefully there's only one in here!
+                ][0]
+
+            # local and remote app data, and remote units data should be in sync already
+            # todo check this!
+            # the only thing we need to sync up is the local units data
+            # (because Relation doesn't keep track of peers' unit data)
+            any_b1_relation = list(b1_relations.values())[0]
+            any_b2_relation = list(b2_relations.values())[0]
+
+            new_integrations.append(
+                Integration(
+                    i.binding1.replace(
+                        local_app_data=any_b1_relation.local_app_data,
+                        remote_app_data=any_b1_relation.remote_app_data,
+                        local_units_data={
+                            unit: rel.local_unit_data
+                            for unit, rel in b1_relations.items()
+                        },
+                        remote_units_data=any_b1_relation.remote_units_data,
+                    ),
+                    i.binding2.replace(
+                        local_app_data=any_b2_relation.local_app_data,
+                        remote_app_data=any_b2_relation.remote_app_data,
+                        local_units_data={
+                            unit: rel.local_unit_data
+                            for unit, rel in b2_relations.items()
+                        },
+                        remote_units_data=any_b2_relation.remote_units_data,
+                    ),
+                )
+            )
+
+        ms_out = model_state.replace(integrations=new_integrations)
+        self._model_state = ms_out
+        return ms_out
 
     def _add_integration(self, integration: Integration):
         """Add an integration to the model."""
         ms_out = self._model_state.replace(
             integrations=self._model_state.integrations + [integration]
         )
-        for relation, app in (
-            (integration.binding1.relation, integration.binding1.app),
-            (integration.binding2.relation, integration.binding2.app),
+        for relation, app, other_app in zip(
+            integration.relations, integration.apps, reversed(integration.apps)
         ):
             self._queue(ms_out, relation.created_event, app)
-            self._queue(ms_out, relation.joined_event, app)
+
+            for remote_unit_id in ms_out.unit_states[other_app]:
+                self._queue(
+                    ms_out, relation.joined_event(remote_unit_id=remote_unit_id), app
+                )
 
             self._queue(ms_out, relation.changed_event, app)
+
         self._model_state = ms_out
         return ms_out
 
@@ -492,22 +560,46 @@ class Catan:
         endpoint2: str,
     ):
         """Integrate two apps."""
-        relation1 = Relation(endpoint1)
-        relation2 = Relation(endpoint2)
-        integration = Integration(Binding(app1, relation1), Binding(app2, relation2))
+        integration = Integration(
+            Binding(
+                app1,
+                endpoint1,
+                local_units_data={
+                    uid: {} for uid in self.model_state.unit_states[app1]
+                },
+            ),
+            Binding(
+                app2,
+                endpoint2,
+                local_units_data={
+                    uid: {} for uid in self.model_state.unit_states[app2]
+                },
+            ),
+        )
         return self._add_integration(integration)
 
     def disintegrate(self, integration: Integration) -> ModelState:
         """Remove an integration."""
         model_state = self._model_state
-        app1, app2 = integration.apps
 
-        for app, relation in (
-            (app1, integration.binding1.relation),
-            (app2, integration.binding2.relation),
+        for relation, app, other_app in zip(
+            integration.relations, integration.apps, reversed(integration.apps)
         ):
-            # todo do this for all <other app> units
-            self._queue(model_state, relation.departed_event, app)
+            # if the remote app has scale zero, removing the integration will not fire any
+            # departed events on this app
+            # for remote_unit_id in model_state.unit_states.get(other_app, ()):
+            departing_units_ids = list(
+                model_state.unit_states.get(
+                    other_app, self._dead_unit_states[other_app]
+                )
+            )
+            for remote_unit_id in departing_units_ids:
+                self._queue(
+                    model_state,
+                    relation.departed_event(remote_unit_id=remote_unit_id),
+                    app,
+                )
+
             self._queue(model_state, relation.broken_event, app)
 
         ms_out = model_state.replace(
@@ -525,14 +617,14 @@ class Catan:
             if (
                 integration.binding1.app == app1
                 and integration.binding2.app == app2
-                and integration.binding1.relation.endpoint == endpoint
+                and integration.binding1.endpoint == endpoint
             ):
                 to_remove = integration
                 break
             if (
                 integration.binding1.app == app2
                 and integration.binding2.app == app1
-                and integration.binding1.relation.endpoint == endpoint
+                and integration.binding1.endpoint == endpoint
             ):
                 app1, app2 = app2, app1
                 to_remove = integration
@@ -660,8 +752,8 @@ class Catan:
             for prov_app, prov_ep in providers[interface]:
                 for req_app, req_ep in requirers[interface]:
                     integration = Integration(
-                        Binding(prov_app, Relation(prov_ep)),
-                        Binding(req_app, Relation(req_ep)),
+                        Binding(prov_app, prov_ep),
+                        Binding(req_app, req_ep),
                     )
                     self._add_integration(integration)
                     integrations.append(integration)
@@ -685,7 +777,7 @@ class Catan:
         # set this first so that queue_setup_sequence will use it
         self._model_state = new_model_state
 
-        # remove all integrations where app is involved
+        # remove all integrations where app is involved BEFORE nuking the app
         self.imatrix_clear(app)
 
         # we could call queue_teardown_sequence(app), but depending on who's the leader that might
@@ -772,7 +864,16 @@ class Catan:
 
     @property
     def _emitted_repr(self):
-        return [f"{e.app.name}/{e.unit_id} :: {e.event.path}" for e in self._emitted]
+        out = []
+        for e in self._emitted:
+            remote_unit = (
+                f"({e.event.relation.remote_app_name}/{e.event.relation_remote_unit_id})"
+                if e.event.relation_remote_unit_id is not None
+                else ""
+            )
+
+            out.append(f"{e.app.name}/{e.unit_id} :: {e.event.path}{remote_unit}")
+        return out
 
     def shuffle(self, respect_sequences: bool = True):
         """In-place-shuffle self._event_queue."""
