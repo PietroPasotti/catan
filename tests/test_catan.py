@@ -519,3 +519,56 @@ def test_shuffle_nonsequential(tempo, tempo_state, traefik, traefik_state):
         "traefik/1 :: config_changed",
         "traefik/1 :: install",
     ]
+
+
+def test_imatrix_fill(tempo, tempo_state, traefik, traefik_state):
+
+    ms = ModelState(
+        {
+            tempo: {
+                0: tempo_state.replace(leader=True),
+                1: tempo_state.replace(leader=False),
+            },
+            traefik: {0: traefik_state.replace(leader=True)},
+        }
+    )
+    c = Catan(ms)
+    created = c.imatrix_fill()
+    assert len(created) == 2
+
+    ms_final = c.settle()
+
+    assert c._emitted_repr == [
+        "tempo/0 :: tracing_relation_created",
+        "tempo/1 :: tracing_relation_created",
+        "tempo/0 :: tracing_relation_joined",
+        "tempo/1 :: tracing_relation_joined",
+        "tempo/0 :: tracing_relation_changed",
+        "tempo/1 :: tracing_relation_changed",
+        "traefik/0 :: tracing_relation_created",
+        "traefik/0 :: tracing_relation_joined",
+        "traefik/0 :: tracing_relation_changed",
+        "traefik/0 :: traefik_route_relation_created",
+        "traefik/0 :: traefik_route_relation_joined",
+        "traefik/0 :: traefik_route_relation_changed",
+        "tempo/0 :: ingress_relation_created",
+        "tempo/1 :: ingress_relation_created",
+        "tempo/0 :: ingress_relation_joined",
+        "tempo/1 :: ingress_relation_joined",
+        "tempo/0 :: ingress_relation_changed",
+        "tempo/1 :: ingress_relation_changed",
+        "tempo/0 :: tracing_relation_changed",
+        "tempo/1 :: tracing_relation_changed",
+        "tempo/0 :: ingress_relation_changed",
+        "tempo/1 :: ingress_relation_changed",
+        "traefik/0 :: tracing_relation_changed",
+        "traefik/0 :: traefik_route_relation_changed",
+    ]
+    assert len(ms_final.integrations) == 2
+    ingress = c.get_integration(traefik, "traefik-route", tempo)
+    tracing = c.get_integration(traefik, "tracing", tempo)
+
+    assert (
+        ms_final.unit_states[traefik][0].get_relations("tracing")[0]
+        is tracing.binding2.relation
+    )

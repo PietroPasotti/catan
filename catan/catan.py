@@ -104,92 +104,6 @@ class Integration(_DCBase):
         """Apps partaking in this integration."""
         return self.binding1.app, self.binding2.app
 
-    def sync(
-        self,
-        c: "Catan",
-        model_state_out: "ModelState",
-        app: "App" = None,
-        unit_id: int = None,
-        queue: bool = True,
-    ):
-        """Sync this integration's bindings and queue any events on Catan."""
-
-        def _sync(states_from, states_to, binding_from: Binding, binding_to: Binding):
-            # simplifying a bit:
-            # if b1's local app data is different from b2's remote app data:
-            # copy it over and notify all b2 apps of the change in remote app data
-
-            # this is the unit that's made changes to the state.
-            # If not given, it means we're doing an initial sync (not as a consequence of a
-            # specific charm executing) and so any unit will do.
-            # this ASSUMES that all input states will be equivalent.
-            master_state = states_from[unit_id or 0]
-            any_b1_relation = master_state.get_relations(
-                binding_from.relation.endpoint
-            )[0]
-
-            # not nice, but inevitable?
-            any_b2_state = next(iter(states_to.values()))
-            any_b2_relation = any_b2_state.get_relations(binding_to.relation.endpoint)[
-                0
-            ]
-
-            if any_b1_relation.local_app_data == any_b2_relation.remote_app_data:
-                # no changes!
-                logger.debug("nothing to sync: relation data didn't change")
-                return
-
-            # copy over all relations; the one this endpoint is about would be enough,
-            # but we don't quite care as the rest shouldn't have changed either.
-            new_states_1 = {
-                uid: follower_state.replace(relations=master_state.relations)
-                for uid, follower_state in states_from.items()
-            }
-            # we copy the local app data of any relation in the master state
-            local_app_data = any_b1_relation.local_app_data
-            # todo sync unit data
-
-            # now we copy the local app data of the master state into the remote app data of each state
-            # of the remote app
-            # any state will do, they should all be
-            # the same where the relation is concerned
-            # all relations in binding_to stay the same for other endpoints, but for
-            # the binding_to endpoint that's being changed,
-            # we replace remote app data with binding_from's local app data.
-            any_state_to = next(iter(states_to.values()))
-            new_relations_b2 = [
-                r
-                for r in any_state_to.relations
-                if r.endpoint != binding_to.relation.endpoint
-            ] + [
-                r.replace(remote_app_data=local_app_data)
-                for r in any_state_to.relations
-                if r.endpoint == binding_to.relation.endpoint
-            ]
-            new_states_2 = {
-                uid: unit_state.replace(relations=new_relations_b2)
-                for uid, unit_state in states_to.items()
-            }
-
-            model_state_out.unit_states[binding_from.app] = new_states_1
-            model_state_out.unit_states[binding_to.app] = new_states_2
-
-            if queue:
-                c.queue(any_b2_relation.changed_event, binding_to.app)
-
-        # we assume that every state transition only touches a single state: namely that of
-        # app/unit.
-
-        b1, b2 = self.binding1, self.binding2
-        states_out_b1 = model_state_out.unit_states[b1.app]
-        states_out_b2 = model_state_out.unit_states[b2.app]
-
-        if app is None or app == b1.app:
-            _sync(states_out_b1, states_out_b2, b1, b2)
-
-        if app is None or app == b2.app:
-            _sync(states_out_b2, states_out_b1, b2, b1)
-
 
 @dataclasses.dataclass(frozen=True)
 class _HistoryItem(_DCBase):
@@ -350,7 +264,7 @@ class Catan:
 
     def settle(self) -> ModelState:
         """Settle Catan."""
-        model_state = self._initial_sync(self._model_state)
+        model_state = self._initial_sync()
 
         i = 0
 
@@ -362,7 +276,7 @@ class Catan:
             logger.info(f"processing item {item} ({i}/{len(self._event_queue)})")
 
             ms_out = self._fire(model_state, item.event, item.app, item.unit_id)
-            ms_out_synced = self._sync(ms_out, item.app, item.unit_id)
+            ms_out_synced = self._model_reconcile(ms_out, item.app, item.unit_id)
             model_state = ms_out_synced
 
         if i == 0:
@@ -428,8 +342,9 @@ class Catan:
 
         return ms_out
 
-    @staticmethod
-    def _initial_sync(model_state: ModelState) -> ModelState:
+    def _initial_sync(self) -> ModelState:
+        """Bring the unit states in sync with what's in the Integrations."""
+
         def _sync(relation_1: Relation, relation_2: Relation, states: Dict[int, State]):
             # relation = relation_1.replace(remote_app_data=relation_2.local_app_data)
             return {
@@ -437,6 +352,7 @@ class Catan:
                 for uid, s in states.items()
             }
 
+        model_state = self._model_state
         new_states = model_state.unit_states.copy()
 
         for i in model_state.integrations:
@@ -447,12 +363,126 @@ class Catan:
 
         return model_state.replace(unit_states=new_states)
 
-    def _sync(self, model_state_out: ModelState, app: App, unit_id: int):
+    def _model_reconcile(self, model_state_out: ModelState, app: App, unit_id: int):
         """Check what has changed between the model states and queue any generated events."""
         # fixme: no model_state_out mutation
         for i in model_state_out.integrations:
-            i.sync(self, model_state_out, app, unit_id)
+            self._reconcile_integration(model_state_out, i, app, unit_id)
         return model_state_out
+
+    def _reconcile_integration(
+        self,
+        model_state_out: "ModelState",
+        integration: Integration,
+        app: "App" = None,
+        unit_id: int = None,
+        queue: bool = True,
+    ):
+        """Sync this integration's bindings and queue any events on Catan."""
+
+        def _sync(states_from, states_to, binding_from: Binding, binding_to: Binding):
+            # simplifying a bit:
+            # if b1's local app data is different from b2's remote app data:
+            # copy it over and notify all b2 apps of the change in remote app data
+
+            # this is the unit that's made changes to the state.
+            # If not given, it means we're doing an initial sync (not as a consequence of a
+            # specific charm executing) and so any unit will do.
+            # this ASSUMES that all input states will be equivalent.
+            master_state = states_from[unit_id or 0]
+            any_b1_relation = master_state.get_relations(
+                binding_from.relation.endpoint
+            )[0]
+
+            # not nice, but inevitable?
+            any_b2_state = next(iter(states_to.values()))
+            any_b2_relation = any_b2_state.get_relations(binding_to.relation.endpoint)[
+                0
+            ]
+
+            if any_b1_relation.local_app_data == any_b2_relation.remote_app_data:
+                # no changes!
+                logger.debug("nothing to sync: relation data didn't change")
+                return
+
+            # copy over all relations; the one this endpoint is about would be enough,
+            # but we don't quite care as the rest shouldn't have changed either.
+            new_states_1 = {
+                uid: follower_state.replace(relations=master_state.relations)
+                for uid, follower_state in states_from.items()
+            }
+            # we copy the local app data of any relation in the master state
+            local_app_data = any_b1_relation.local_app_data
+            # todo sync unit data
+
+            # now we copy the local app data of the master state into the remote app data of each state
+            # of the remote app
+            # any state will do, they should all be
+            # the same where the relation is concerned
+            # all relations in binding_to stay the same for other endpoints, but for
+            # the binding_to endpoint that's being changed,
+            # we replace remote app data with binding_from's local app data.
+            any_state_to = next(iter(states_to.values()))
+            new_relations_b2 = [
+                r
+                for r in any_state_to.relations
+                if r.endpoint != binding_to.relation.endpoint
+            ] + [
+                r.replace(remote_app_data=local_app_data)
+                for r in any_state_to.relations
+                if r.endpoint == binding_to.relation.endpoint
+            ]
+            new_states_2 = {
+                uid: unit_state.replace(relations=new_relations_b2)
+                for uid, unit_state in states_to.items()
+            }
+
+            model_state_out.unit_states[binding_from.app] = new_states_1
+            model_state_out.unit_states[binding_to.app] = new_states_2
+
+            if queue:
+                self.queue(any_b2_relation.changed_event, binding_to.app)
+
+        # we assume that every state transition only touches a single state: namely that of
+        # app/unit.
+
+        b1, b2 = integration.binding1, integration.binding2
+        states_out_b1 = model_state_out.unit_states[b1.app]
+        states_out_b2 = model_state_out.unit_states[b2.app]
+
+        if app is None or app == b1.app:
+            _sync(states_out_b1, states_out_b2, b1, b2)
+
+        if app is None or app == b2.app:
+            _sync(states_out_b2, states_out_b1, b2, b1)
+
+    def _final_sync(self):
+        """Bring the Integrations in sync with what's in model's unit states."""
+        model_state = self._model_state
+        new_integrations = []
+
+        for i in model_state.integrations:
+            b1 = i.binding1
+            b2 = i.binding2
+            new_integrations.append(i.replace())
+
+        return model_state.replace(integrations=new_integrations)
+
+    def _add_integration(self, integration: Integration):
+        """Add an integration to the model."""
+        ms_out = self._model_state.replace(
+            integrations=self._model_state.integrations + [integration]
+        )
+        for relation, app in (
+            (integration.binding1.relation, integration.binding1.app),
+            (integration.binding2.relation, integration.binding2.app),
+        ):
+            self._queue(ms_out, relation.created_event, app)
+            self._queue(ms_out, relation.joined_event, app)
+
+            self._queue(ms_out, relation.changed_event, app)
+        self._model_state = ms_out
+        return ms_out
 
     def integrate(
         self,
@@ -461,21 +491,11 @@ class Catan:
         app2: App,
         endpoint2: str,
     ):
-        """Add an integration."""
+        """Integrate two apps."""
         relation1 = Relation(endpoint1)
         relation2 = Relation(endpoint2)
         integration = Integration(Binding(app1, relation1), Binding(app2, relation2))
-        ms_out = self._model_state.replace(
-            integrations=self._model_state.integrations + [integration]
-        )
-        for relation, app in ((relation1, app1), (relation2, app2)):
-            self._queue(ms_out, relation.created_event, app)
-            # todo do this for each <other app> unit
-            self._queue(ms_out, relation.joined_event, app)
-
-            self._queue(ms_out, relation.changed_event, app)
-        self._model_state = ms_out
-        return ms_out
+        return self._add_integration(integration)
 
     def disintegrate(self, integration: Integration) -> ModelState:
         """Remove an integration."""
@@ -597,6 +617,57 @@ class Catan:
         self.queue_setup_sequence(app, unit)
         return new_model_state
 
+    def imatrix_clear(self, *app: App) -> List[Integration]:
+        """Remove all relations (involving app)."""
+        gone = []
+        for integration in list(self._model_state.integrations):
+            if app:
+                if any(a in integration.apps for a in app) and integration not in gone:
+                    self.disintegrate(integration)
+                    gone.append(integration)
+            else:
+                self.disintegrate(integration)
+                gone.append(integration)
+        return gone
+
+    def imatrix_fill(self, *app: App) -> List[Integration]:
+        """Cross-relate all that's relatable (only including *app)."""
+
+        # mapping from apps to interfaces to endpoints
+        providers = {}
+        requirers = {}
+
+        pool = app or list(self._model_state.unit_states)
+
+        for _app in pool:
+            # mapping from interfaces to app, endpoint pairs
+            providers_from_app = defaultdict(list)
+            for endpoint, ep_meta in _app.charm.meta.get("provides", {}).items():
+                providers_from_app[ep_meta["interface"]].append((_app, endpoint))
+            providers.update(providers_from_app)
+
+            requirers_from_app = defaultdict(list)
+            for endpoint, ep_meta in _app.charm.meta.get("requires", {}).items():
+                requirers_from_app[ep_meta["interface"]].append((_app, endpoint))
+            requirers.update(requirers_from_app)
+
+        # interfaces that have both a requirer and a provider in the pool of apps under consideration
+        # sorting is to make our lives easier in testing
+        shared_interfaces = sorted(set(providers).intersection(set(requirers)))
+
+        integrations = []
+        for interface in shared_interfaces:
+            for prov_app, prov_ep in providers[interface]:
+                for req_app, req_ep in requirers[interface]:
+                    integration = Integration(
+                        Binding(prov_app, Relation(prov_ep)),
+                        Binding(req_app, Relation(req_ep)),
+                    )
+                    self._add_integration(integration)
+                    integrations.append(integration)
+
+        return integrations
+
     def remove_app(self, app: App):
         """Remove an app."""
         model_state = self._model_state
@@ -614,9 +685,8 @@ class Catan:
         # set this first so that queue_setup_sequence will use it
         self._model_state = new_model_state
 
-        for integration in new_model_state.integrations:
-            if app in integration.apps:
-                self.disintegrate(integration)
+        # remove all integrations where app is involved
+        self.imatrix_clear(app)
 
         # we could call queue_teardown_sequence(app), but depending on who's the leader that might
         # trigger a lot more events than we'd like. If we're destroying the app there's no point
