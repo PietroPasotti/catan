@@ -1,3 +1,4 @@
+import random
 from unittest.mock import patch
 
 import pytest
@@ -107,6 +108,38 @@ def traefik_state():
             )
         ],
     )
+
+
+def test_fixed_sequence(tempo, tempo_state, traefik, traefik_state):
+    c = Catan()
+
+    with c.fixed_sequence():
+        c._queue(c.model_state, "start", tempo, 0)
+        c._queue(c.model_state, "install", tempo, 0)
+        c._queue(c.model_state, "config-changed", tempo, 0)
+
+    e1, e2, e3 = c._event_queue
+    assert e1.group == e2.group == e3.group == 0
+    assert [e._index for e in c._event_queue] == [0, 1, 2]
+
+
+def test_fixed_sequence_multiple(tempo, tempo_state, traefik, traefik_state):
+    c = Catan()
+
+    with c.fixed_sequence():
+        c._queue(c.model_state, "start", tempo, 0)
+        c._queue(c.model_state, "install", tempo, 0)
+        c._queue(c.model_state, "config-changed", tempo, 0)
+
+    with c.fixed_sequence():
+        c._queue(c.model_state, "foo", tempo, 0)
+        c._queue(c.model_state, "bar", tempo, 0)
+        c._queue(c.model_state, "baz", tempo, 0)
+
+    e1, e2, e3, e4, e5, e6 = c._event_queue
+    assert e1.group == e2.group == e3.group == 0
+    assert e4.group == e5.group == e6.group == 1
+    assert [e._index for e in c._event_queue] == [0, 1, 2, 3, 4, 5]
 
 
 def test_event_queue_expansion(tempo, tempo_state, traefik, traefik_state):
@@ -346,3 +379,44 @@ def test_add_unit(tempo, tempo_state, traefik, traefik_state):
 def test_shuffle(tempo, tempo_state, traefik, traefik_state):
     c = Catan()
     c.deploy(traefik, ids=(1, 3), state_template=traefik_state)
+
+    random.seed(123123123123123)
+
+    c.shuffle()
+    assert c._event_queue
+    c.settle()
+
+    # relative ordering of both setup sequences is maintained
+    assert c._emitted_repr == [
+        "traefik/1 :: install",
+        "traefik/3 :: install",
+        "traefik/1 :: leader_elected",
+        "traefik/1 :: config_changed",
+        "traefik/3 :: leader_settings_changed",
+        "traefik/1 :: start",
+        "traefik/3 :: config_changed",
+        "traefik/3 :: start",
+    ]
+
+
+def test_shuffle_nonsequential(tempo, tempo_state, traefik, traefik_state):
+    c = Catan()
+    c.deploy(traefik, ids=(1, 3), state_template=traefik_state)
+
+    random.seed(123123123123123)
+
+    c.shuffle(respect_sequences=False)
+    assert c._event_queue
+    c.settle()
+
+    # anything goes
+    assert c._emitted_repr == [
+        "traefik/3 :: config_changed",
+        "traefik/3 :: leader_settings_changed",
+        "traefik/1 :: start",
+        "traefik/1 :: leader_elected",
+        "traefik/3 :: start",
+        "traefik/3 :: install",
+        "traefik/1 :: config_changed",
+        "traefik/1 :: install",
+    ]

@@ -1,6 +1,8 @@
 import dataclasses
 import logging
+import random
 import sys
+from collections import defaultdict
 from contextlib import contextmanager
 from functools import partial
 from importlib import import_module
@@ -206,6 +208,9 @@ class _QueueItem:
     group: Optional[bool]
     _index: int = dataclasses.field(default_factory=lambda: next(_qitem_counter))
 
+    def __repr__(self):
+        return f"Q<{self.event.name}({self.group or '-'}/{self._index})>"
+
 
 class Catan:
     """Model-level State convergence tool.
@@ -246,6 +251,7 @@ class Catan:
         qitem = _QueueItem(event, app, unit_id, group=self._current_group)
         expanded = self._expand_queue_item(model_state, qitem)
         self._event_queue.extend(expanded)
+        return expanded
 
     @staticmethod
     def _expand_queue_item(
@@ -261,7 +267,7 @@ class Catan:
 
             if app is not None:
                 if unit_id is not None:
-                    return [_QueueItem(event, app, unit_id, group)]
+                    return [qitem]
                 return [
                     _QueueItem(event, app, unit_, group)
                     for unit_ in ms.unit_states[app]
@@ -568,3 +574,28 @@ class Catan:
 
     def shuffle(self, respect_sequences: bool = True):
         """In-place-shuffle self._event_queue."""
+        if respect_sequences:
+            groups = defaultdict(list)
+
+            for item in self._event_queue:
+                if item.group:
+                    groups[item.group].append(item)
+                else:
+                    # ungrouped elements go to -1
+                    groups[-1].append(item)
+
+            queue = []
+
+            while groups:
+                # pop the first element from a randomly selected ordered sequence
+                target = random.choice(list(groups))
+                sequence = groups[target]
+                queue.append(sequence.pop(0))
+
+                if not sequence:
+                    del groups[target]
+
+            self._event_queue = queue
+
+        else:
+            random.shuffle(self._event_queue)
