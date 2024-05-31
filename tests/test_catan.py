@@ -3,7 +3,7 @@ from unittest.mock import patch
 
 import pytest
 from ops.pebble import Layer
-from scenario import Container, ExecOutput, Relation, State, Event
+from scenario import Container, Event, ExecOutput, Relation, State
 
 from catan.catan import App, Binding, Catan, Integration, ModelState, _QueueItem
 
@@ -509,7 +509,6 @@ def test_shuffle_nonsequential(tempo, tempo_state, traefik, traefik_state):
 
 
 def test_imatrix_fill(tempo, tempo_state, traefik, traefik_state):
-
     ms = ModelState(
         {
             tempo: {

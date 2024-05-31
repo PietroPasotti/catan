@@ -1,7 +1,6 @@
 ops-scenario
 pytest
 deepmerge
-jsonpatch
 cosl
 
 # Tempo deps

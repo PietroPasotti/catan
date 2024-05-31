@@ -4,27 +4,32 @@ import random
 import sys
 from collections import defaultdict
 from contextlib import contextmanager
-from functools import partial, singledispatch
+from functools import partial
 from importlib import import_module
 from itertools import chain, count
 from pathlib import Path
-from typing import Dict, List, Optional, Union, Sequence, Iterable, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union, cast
 
+import scenario  # pyright: ignore[reportMissingImports]
 from ops import CharmBase
-from scenario import *
-from scenario.state import _CharmSpec, _DCBase
+from scenario.state import _CharmSpec, _DCBase  # pyright: ignore[reportMissingImports]
 
 logger = logging.getLogger("catan")
 
 
 @dataclasses.dataclass(frozen=True)
 class App(_DCBase):
+    """Application."""
+
     charm: _CharmSpec
-    leader_id: int = None
-    alias: str = None
+    leader_id: Optional[int] = None
+    alias: Optional[str] = None
 
     @staticmethod
-    def from_path(path: Union[str, Path], name: str = None, patches=None):
+    def from_path(
+        path: Union[str, Path], name: Optional[str] = None, patches: Any = None
+    ):
+        """Load app from local path."""
         charm_root = Path(path)
         if not charm_root.exists():
             raise RuntimeError(
@@ -68,14 +73,14 @@ class App(_DCBase):
         sys.modules.pop("charm")
         return App(spec, alias=name or spec.meta["name"])
 
-    def binding(self, name: str):
-        raise NotImplementedError()
-
     @property
     def name(self):
+        """App name as visible to the user."""
         return self.alias or self.charm.meta["name"]
 
-    def __eq__(self, other: "App"):
+    def __eq__(self, other: "App"):  # pyright: ignore[reportIncompatibleMethodOverride]
+        if not isinstance(other, App):
+            raise RuntimeError(f"cannot __eq__(App, {type(other).__name__}")
         return self.name == other.name
 
     def __hash__(self):
@@ -88,6 +93,8 @@ class App(_DCBase):
 
 @dataclasses.dataclass(frozen=True)
 class Binding(_DCBase):
+    """Integration endpoint binding."""
+
     app: App
     endpoint: str
 
@@ -117,14 +124,14 @@ class Integration(_DCBase):
         return self.binding1.app, self.binding2.app
 
     @property
-    def relations(self) -> Tuple[Relation, Relation]:
+    def relations(self) -> Tuple[scenario.Relation, scenario.Relation]:
         """Relations."""
         return (
-            Relation(
+            scenario.Relation(
                 endpoint=self.binding1.endpoint,
                 remote_app_name=self.binding2.app.name,
             ),
-            Relation(
+            scenario.Relation(
                 endpoint=self.binding2.endpoint,
                 remote_app_name=self.binding1.app.name,
             ),
@@ -133,19 +140,23 @@ class Integration(_DCBase):
 
 @dataclasses.dataclass(frozen=True)
 class _HistoryItem(_DCBase):
-    event: Event
+    event: scenario.Event
     app: App
     unit_id: int
-    state_out: State
+    state_out: scenario.State
 
 
 @dataclasses.dataclass(frozen=True)
 class ModelState(_DCBase):
-    unit_states: Dict[App, Dict[int, State]] = dataclasses.field(default_factory=dict)
+    """Model state."""
+
+    unit_states: Dict[App, Dict[int, scenario.State]] = dataclasses.field(
+        default_factory=dict
+    )
     """Mapping from apps to the states of their units."""
 
     integrations: List[Integration] = dataclasses.field(default_factory=list)
-    model: Model = dataclasses.field(default_factory=Model)
+    model: scenario.Model = dataclasses.field(default_factory=scenario.Model)
 
     def __str__(self):
         no_units = sum(map(len, self.unit_states.values()))
@@ -157,10 +168,10 @@ _qitem_counter = count()
 
 @dataclasses.dataclass
 class _QueueItem:
-    event: Event
+    event: scenario.Event
     app: Optional[App]
     unit_id: Optional[Optional[int]]
-    group: Optional[bool]
+    group: Optional[int]
     _index: int = dataclasses.field(default_factory=lambda: next(_qitem_counter))
 
     def __repr__(self):
@@ -168,7 +179,7 @@ class _QueueItem:
 
 
 class Catan:
-    """Model-level State convergence tool.
+    """Model-level scenario.State convergence tool.
 
     Settlers of Juju unite!
     Like scenario, but for multiple charms.
@@ -179,7 +190,7 @@ class Catan:
 
         # used to keep track of states we remove from self._model_state (e.g. with remove_unit)
         # but we still need in order to be able to scenario the charm.
-        self._dead_unit_states: Dict[App, Dict[int, State]] = defaultdict(dict)
+        self._dead_unit_states: Dict[App, Dict[int, scenario.State]] = defaultdict(dict)
         self._event_queue: List[_QueueItem] = []
         self._emitted: List[_HistoryItem] = []
 
@@ -191,20 +202,24 @@ class Catan:
         """The model state attached to this Catan."""
         return self._model_state
 
-    def queue(self, event: Union[Event, str], app: App = None, unit_id: int = None):
+    def queue(
+        self,
+        event: Union[scenario.Event, str],
+        app: Optional[App] = None,
+        unit_id: Optional[int] = None,
+    ):
         """Queue an event for emission on an app or a unit."""
         self._queue(self._model_state, event, app, unit_id)
 
     def _queue(
         self,
         model_state: ModelState,
-        event: Union[str, Event],
+        event: Union[str, scenario.Event],
         app: Optional[App] = None,
         unit_id: Optional[int] = None,
     ):
-
         if isinstance(event, str):
-            event = Event(event)
+            event = scenario.Event(event)
 
         qitem = _QueueItem(event, app, unit_id, group=self._current_group)
         expanded = self._expand_queue_item(model_state, qitem)
@@ -252,7 +267,7 @@ class Catan:
 
     @contextmanager
     def fixed_sequence(self):
-        """Context to keep together all events queued together."""
+        """Keep together any events queued within this context."""
         self._current_group = self._fixed_sequence_counter
         logger.debug(f"starting group sequence {self._fixed_sequence_counter}")
 
@@ -261,23 +276,6 @@ class Catan:
         self._fixed_sequence_counter += 1
         self._current_group = None
         logger.debug(f"exiting group sequence {self._fixed_sequence_counter}")
-
-    @staticmethod
-    def _get_priority(event: Event):
-        suffixes_to_priority = {
-            "_action": 150,
-            "relation_created": 100,
-            "relation_broken": 99,
-            "relation_joined": 98,
-            "relation_departed": 98,
-            "relation_changed": 50,
-            "config_changed": 49,
-            "update_status": 0,
-        }
-        for suffix, prio in suffixes_to_priority.items():
-            if event.name.endswith(suffix):
-                return prio
-        return 50
 
     def _get_next_queue_item(self):
         if self._event_queue:
@@ -301,14 +299,18 @@ class Catan:
             i += 1
             logger.info(f"processing item {item} ({i}/{len(self._event_queue)})")
 
-            ms_out = self._fire(model_state, item.event, item.app, item.unit_id)
-            ms_out_synced = self._model_reconcile(ms_out, item.app, item.unit_id)
+            # queue items are fully specified
+            app = cast(App, item.app)
+            unit_id = cast(int, item.unit_id)
+
+            ms_out = self._fire(model_state, item.event, app, unit_id)
+            ms_out_synced = self._model_reconcile(ms_out, app, unit_id)
             model_state = ms_out_synced
 
         if i == 0:
             logger.warning(
-                "Event queue empty: converged in zero iterations. "
-                "Model state unchanged (modulo initial sync)."
+                "scenario.Event queue empty: converged in zero iterations. "
+                "scenario.Model state unchanged (modulo initial sync)."
             )
             return self._final_sync(model_state)
 
@@ -318,9 +320,11 @@ class Catan:
         return self._final_sync(model_state)
 
     @staticmethod
-    def _run_scenario(app: App, unit_id: int, unit_state: State, event: Event) -> State:
+    def _run_scenario(
+        app: App, unit_id: int, unit_state: scenario.State, event: scenario.Event
+    ) -> scenario.State:
         logger.info("running scenario...")
-        context = Context(
+        context = scenario.Context(
             app.charm.charm_type,
             # pass meta, config, actions instead of letting _CharmSpec.autoload() again because
             # we've already removed the path from sys.modules, so attempting to find the source
@@ -337,7 +341,11 @@ class Catan:
             return context.run(event, unit_state)
 
     def _fire(
-        self, model_state: ModelState, event: Event, app: App, unit_id: int
+        self,
+        model_state: ModelState,
+        event: scenario.Event,
+        app: App,
+        unit_id: int,
     ) -> ModelState:
         logger.info(f"firing {event} on {app}:{unit_id}")
         # don't mutate: replace.
@@ -361,15 +369,15 @@ class Catan:
         self._emitted.append(_HistoryItem(event, app, unit_id, state_out))
 
         if not dead_unit:
-            units[unit_id] = state_out  # noqa
-            ms_out.unit_states[app] = units
+            units[unit_id] = state_out  # pyright: ignore[reportUnboundVariable]
+            ms_out.unit_states[app] = units  # pyright: ignore[reportUnboundVariable]
 
         return ms_out
 
     def _initial_sync(self) -> ModelState:
         """Bring the unit states in sync with what's in the Integrations."""
 
-        def _sync(relation, states: Dict[int, State]):
+        def _sync(relation, states: Dict[int, scenario.State]):
             return {
                 uid: s.replace(relations=s.relations + [relation])
                 for uid, s in states.items()
@@ -398,9 +406,9 @@ class Catan:
         self,
         model_state_out: "ModelState",
         integration: Integration,
-        app: "App" = None,
-        unit_id: int = None,
-        queue: bool = True,
+        app: Optional["App"] = None,
+        unit_id: Optional[int] = None,
+        queue: Optional[bool] = True,
     ):
         """Sync this integration's bindings and queue any events on Catan."""
 
@@ -501,7 +509,7 @@ class Catan:
             # local and remote app data, and remote units data should be in sync already
             # todo check this!
             # the only thing we need to sync up is the local units data
-            # (because Relation doesn't keep track of peers' unit data)
+            # (because scenario.Relation doesn't keep track of peers' unit data)
             any_b1_relation = list(b1_relations.values())[0]
             any_b2_relation = list(b2_relations.values())[0]
 
@@ -637,15 +645,15 @@ class Catan:
 
     def run_action(
         self,
-        action: Union[str, Action],
+        action: Union[str, scenario.Action],
         app: App,
         unit: Optional[int] = None,
     ):
         """Run an action on all units or a specific one."""
-        if not isinstance(action, Action):
-            action = Action(action)
+        if not isinstance(action, scenario.Action):
+            action = scenario.Action(action)
 
-        self._queue(self._model_state, action.event, app, unit)
+        self._queue(self._model_state, cast(scenario.Action, action).event, app, unit)
 
     def queue_setup_sequence(self, app: App, unit: Optional[int] = None):
         """Queues setup phase event sequence for this app/unit."""
@@ -690,7 +698,7 @@ class Catan:
         self,
         app: App,
         unit: int,
-        state: State,
+        state: scenario.State,
     ):
         """Adds a unit to this application."""
         model_state = self._model_state
@@ -835,7 +843,7 @@ class Catan:
         self,
         app: App,
         ids: Sequence[int],
-        state_template: State,
+        state_template: scenario.State,
         leader_id: Optional[int] = None,
     ):
         """Deploy an app."""
@@ -864,6 +872,7 @@ class Catan:
 
     @property
     def _emitted_repr(self):
+        """Utility to summarize the events that have been emitted by this Catan."""
         out = []
         for e in self._emitted:
             remote_unit = (

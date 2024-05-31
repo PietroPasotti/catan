@@ -1,3 +1,3 @@
-from catan.catan import App, Catan, Integration, ModelState
+from catan.catan import App, Binding, Catan, Integration, ModelState
 
-__all__ = ["Catan", "App", "ModelState", "Integration"]
+__all__ = ["Catan", "App", "ModelState", "Integration", "Binding"]

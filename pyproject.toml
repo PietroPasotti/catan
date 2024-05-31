@@ -82,12 +82,14 @@ skip-magic-trailing-comma = false
 line-ending = "auto"
 
 [tool.pyright]
-ignore = [
-#    "scenario/sequences.py",
-#    "scenario/capture_events.py"
-]
+ignore = []
+
 [tool.isort]
 profile = "black"
 
 [bdist_wheel]
 universal = 1
+
+[tool.codespell]
+skip = ".git,.tox,build,lib,venv*,.mypy_cache"
+ignore-words-list = "assertIn"
