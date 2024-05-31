@@ -1,5 +1,10 @@
+ops-scenario
+pytest
+deepmerge
+jsonpatch
+cosl
+
 # Tempo deps
-ops
 lightkube==0.11.0
 lightkube-models==1.24.1.4
 opentelemetry-exporter-otlp-proto-http==1.21.0

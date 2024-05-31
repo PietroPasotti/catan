@@ -1,10 +1,12 @@
 import dataclasses
 import logging
 import sys
+from contextlib import contextmanager
+from functools import partial
 from importlib import import_module
-from itertools import chain, starmap
+from itertools import chain, count
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Union, Sequence, Iterable
 
 from ops import CharmBase
 from scenario import *
@@ -78,6 +80,9 @@ class App(_DCBase):
         # app names are going to be model-unique anyway.
         return hash(self.name)
 
+    def __repr__(self):
+        return f"<App: {self.name}>"
+
 
 @dataclasses.dataclass(frozen=True)
 class Binding(_DCBase):
@@ -139,7 +144,8 @@ class Integration(_DCBase):
             # of the remote app
             # any state will do, they should all be
             # the same where the relation is concerned
-            # all relations in binding_to stay the same for other endpoints, but for the binding_to endpoint that's being changed,
+            # all relations in binding_to stay the same for other endpoints, but for
+            # the binding_to endpoint that's being changed,
             # we replace remote app data with binding_from's local app data.
             any_state_to = next(iter(states_to.values()))
             new_relations_b2 = [
@@ -189,22 +195,107 @@ class ModelState(_DCBase):
         return f"<ModelState ({len(self.unit_states)} apps, {no_units} units)>"
 
 
-class Catan:
-    """Model-level State convergence tool."""
+_qitem_counter = count()
 
-    def __init__(self, queue_sorting: bool = True):
-        self._queue_sorting = queue_sorting
-        self._event_queue = []
+
+@dataclasses.dataclass
+class _QueueItem:
+    event: Event
+    app: Optional[App]
+    unit_id: Optional[Optional[int]]
+    group: Optional[bool]
+    _index: int = dataclasses.field(default_factory=lambda: next(_qitem_counter))
+
+
+class Catan:
+    """Model-level State convergence tool.
+
+    - Settlers of Juju unite!
+
+    - Like scenario, but for multiple charms.
+    """
+
+    def __init__(self, model_state: Optional[ModelState] = None):
+        self._model_state = model_state or ModelState()
+        self._event_queue: List[_QueueItem] = []
         self._emitted = []
+
+        self._fixed_sequence_counter = 0
+        self._current_group = None
+
+    @property
+    def model_state(self) -> ModelState:
+        """The model state attached to this Catan."""
+        return self._model_state
 
     def queue(self, event: Union[Event, str], app: App = None, unit_id: int = None):
         """Queue an event for emission on an app or a unit."""
+        self._queue(self._model_state, event, app, unit_id)
+
+    def _queue(
+        self,
+        model_state: ModelState,
+        event: Union[str, Event],
+        app: Optional[App] = None,
+        unit_id: Optional[int] = None,
+    ):
+
         if isinstance(event, str):
             event = Event(event)
-        self._queue(event, app, unit_id)
 
-    def _queue(self, event: Event, app: App, unit_id: int = None):
-        self._event_queue.append((event, app, unit_id))
+        qitem = _QueueItem(event, app, unit_id, group=self._current_group)
+        expanded = self._expand_queue_item(model_state, qitem)
+        self._event_queue.extend(expanded)
+
+    @staticmethod
+    def _expand_queue_item(
+        model_state: ModelState, item: _QueueItem
+    ) -> Iterable[_QueueItem]:
+        """Expand the queue item until all elements are explicit."""
+
+        def _expand(ms: ModelState, qitem: _QueueItem):
+            event = qitem.event
+            app = qitem.app
+            unit_id = qitem.unit_id
+            group = qitem.group
+
+            if app is not None:
+                if unit_id is not None:
+                    return [_QueueItem(event, app, unit_id, group)]
+                return [
+                    _QueueItem(event, app, unit_, group)
+                    for unit_ in ms.unit_states[app]
+                ]
+            return chain(
+                *(
+                    _expand(ms, _QueueItem(event, app, None, group))
+                    for app in ms.unit_states
+                )
+            )
+
+        return chain(*map(partial(_expand, model_state), [item]))
+
+        # def _sorting(elem: _QueueItem):
+        #     # sort by group event priority, then app name, then unit ID.
+        #     # app name and unit ID could be ignored, but we like things deterministic
+        #     return (-self._get_priority(elem.event), elem.app.name, elem.unit_id)
+        #
+        # if self._queue_sorting:
+        #     final = sorted(expanded, key=_sorting)
+        # else:
+        #     final = list(expanded)
+
+    @contextmanager
+    def fixed_sequence(self):
+        """Context to keep together all events queued together."""
+        self._current_group = self._fixed_sequence_counter
+        logger.debug(f"starting group sequence {self._fixed_sequence_counter}")
+
+        yield
+
+        self._fixed_sequence_counter += 1
+        self._current_group = None
+        logger.debug(f"exiting group sequence {self._fixed_sequence_counter}")
 
     @staticmethod
     def _get_priority(event: Event):
@@ -223,66 +314,40 @@ class Catan:
                 return prio
         return 50
 
-    def _expand_event_queue(
-        self, model_state: ModelState
-    ) -> List[Tuple[Event, App, int]]:
-        """Expand the event queue until all elements are explicit."""
+    def _get_next_queue_item(self):
+        if self._event_queue:
+            return self._event_queue.pop(0)
 
-        def _expand(event: Event, app: Optional[App], unit_id: Optional[int]):
-            if app is not None:
-                if unit_id is not None:
-                    return [(event, app, unit_id)]
-                return [(event, app, unit_) for unit_ in model_state.unit_states[app]]
-            return chain(
-                *(_expand(event, app, None) for app in model_state.unit_states)
-            )
-
-        expanded = chain(*starmap(_expand, self._event_queue))
-        self._event_queue = []
-
-        def _sorting(elem: Tuple[Event, App, int]):
-            e_, a_, u_ = elem
-            # sort by event priority, then app name, then unit ID.
-            # app name and unit ID could be ignored, but we like things deterministic
-            return (-self._get_priority(e_), a_.name, u_)
-
-        if self._queue_sorting:
-            final = sorted(expanded, key=_sorting)
-        else:
-            final = list(expanded)
-        return final
-
-    def settle(self, model_state: ModelState) -> ModelState:
+    def settle(self) -> ModelState:
         """Settle Catan."""
-        model_state = self._initial_sync(model_state)
+        model_state = self._initial_sync(self._model_state)
 
-        ms_in = model_state
         i = 0
 
         # todo: infinite loop detection.
         #  e.g. relation-changed ping-pong
-        while q := self._expand_event_queue(ms_in):
-            i += 1
-            q = list(q)
-            logger.info(f"processing iteration {i} ({len(q)} events)...")
 
-            for item in q:
-                event, app, unit_id = item
-                ms_out = self._fire(ms_in, event, app, unit_id)
-                ms_out_synced = self._sync(ms_out, app, unit_id)
-                ms_in = ms_out_synced
+        while item := self._get_next_queue_item():
+            i += 1
+            logger.info(f"processing item {item} ({i}/{len(self._event_queue)})")
+
+            ms_out = self._fire(model_state, item.event, item.app, item.unit_id)
+            ms_out_synced = self._sync(ms_out, item.app, item.unit_id)
+            model_state = ms_out_synced
 
         if i == 0:
             logger.warning(
                 "Event queue empty: converged in zero iterations. "
-                "Model state unchanged."
+                "Model state unchanged (modulo initial sync)."
             )
-            return ms_in
+            self._model_state = model_state
+            return model_state
 
         logger.info(f"Catan settled in {i} iterations")
         log = "\t" + "\n\t".join(self._emitted_repr)
         logger.info(f"Emission log: \n {log}")
-        return ms_in
+        self._model_state = model_state
+        return model_state
 
     @staticmethod
     def _run_scenario(app: App, unit_id: int, unit_state: State, event: Event) -> State:
@@ -317,7 +382,8 @@ class Catan:
         ms_out.unit_states[app] = units
         return ms_out
 
-    def _initial_sync(self, model_state: ModelState) -> ModelState:
+    @staticmethod
+    def _initial_sync(model_state: ModelState) -> ModelState:
         def _sync(relation_1: Relation, relation_2: Relation, states: Dict[int, State]):
             # relation = relation_1.replace(remote_app_data=relation_2.local_app_data)
             return {
@@ -344,7 +410,6 @@ class Catan:
 
     def integrate(
         self,
-        model_state: ModelState,
         app1: App,
         endpoint1: str,
         app2: App,
@@ -354,29 +419,30 @@ class Catan:
         relation1 = Relation(endpoint1)
         relation2 = Relation(endpoint2)
         integration = Integration(Binding(app1, relation1), Binding(app2, relation2))
-        ms_out = model_state.replace(
-            integrations=model_state.integrations + [integration]
+        ms_out = self._model_state.replace(
+            integrations=self._model_state.integrations + [integration]
         )
         for relation, app in ((relation1, app1), (relation2, app2)):
-            self.queue(relation.created_event, app)
+            self._queue(ms_out, relation.created_event, app)
             # todo do this for each <other app> unit
-            self.queue(relation.joined_event, app)
+            self._queue(ms_out, relation.joined_event, app)
 
-            self.queue(relation.changed_event, app)
+            self._queue(ms_out, relation.changed_event, app)
+        self._model_state = ms_out
         return ms_out
 
-    def disintegrate(
-        self, model_state: ModelState, app1: App, endpoint: str, app2: App
-    ) -> ModelState:
+    def disintegrate(self, app1: App, endpoint: str, app2: App) -> ModelState:
         """Remove an integration."""
         to_remove = None
-        for i, integration in enumerate(model_state.integrations):
+        ms = self._model_state
+
+        for i, integration in enumerate(ms.integrations):
             if (
                 integration.binding1.app == app1
                 and integration.binding2.app == app2
                 and integration.binding1.relation.endpoint == endpoint
             ):
-                to_remove = model_state.integrations[i]
+                to_remove = ms.integrations[i]
                 break
             if (
                 integration.binding1.app == app2
@@ -384,7 +450,7 @@ class Catan:
                 and integration.binding1.relation.endpoint == endpoint
             ):
                 app1, app2 = app2, app1
-                to_remove = model_state.integrations[i]
+                to_remove = ms.integrations[i]
                 break
 
         if not to_remove:
@@ -397,22 +463,108 @@ class Catan:
             (app2, to_remove.binding2.relation),
         ):
             # todo do this for all <other app> units
-            self.queue(relation.departed_event)
-            self.queue(relation.broken_event)
+            self._queue(ms, relation.departed_event)
+            self._queue(ms, relation.broken_event)
 
-        return model_state.replace(
-            integrations=[i for i in model_state.integrations if i is not to_remove]
+        ms_out = ms.replace(
+            integrations=[i for i in ms.integrations if i is not to_remove]
         )
+        self._model_state = ms_out
+        return ms_out
 
     def run_action(
-        self, action: Union[str, Action], app: App, unit: Optional[int] = None
+        self,
+        action: Union[str, Action],
+        app: App,
+        unit: Optional[int] = None,
     ):
         """Run an action on all units or a specific one."""
         if not isinstance(action, Action):
             action = Action(action)
 
-        self.queue(action.event, app, unit)
+        self._queue(self._model_state, action.event, app, unit)
+
+    def queue_setup_sequence(self, app: App, unit: Optional[int] = None):
+        """Queues setup phase event sequence for this app/unit."""
+
+        model_state = self._model_state
+
+        if unit is None:
+            for unit_id in model_state.unit_states[app]:
+                self.queue_setup_sequence(app, unit_id)
+            return
+
+        with self.fixed_sequence():
+            self._queue(model_state, "install", app, unit)
+            # todo storage attached events
+            # todo relation events
+            is_leader = model_state.unit_states[app][unit].leader
+            self._queue(
+                model_state,
+                "leader-elected" if is_leader else "leader-settings-changed",
+                app,
+                unit,
+            )
+            self._queue(model_state, "config-changed", app, unit)
+            self._queue(model_state, "start", app, unit)
+
+    def add_unit(
+        self,
+        app: App,
+        unit: int,
+        state: State,
+    ):
+        """Adds a unit to this application."""
+        model_state = self._model_state
+        new_states = model_state.unit_states.copy()
+
+        if unit in new_states[app]:
+            raise RuntimeError(f"{app.name}/{unit} exists already in the model state")
+
+        if state.leader:
+            raise RuntimeError("new units cannot join as leaders.")
+
+        new_states[app][unit] = state
+        new_model_state = model_state.replace(unit_states=new_states)
+
+        self._model_state = new_model_state
+        self.queue_setup_sequence(app, unit)
+        return new_model_state
+
+    def deploy(
+        self,
+        app: App,
+        ids: Sequence[int],
+        state_template: State,
+        leader_id: Optional[int] = None,
+    ):
+        """Deploy an app."""
+        model_state = self._model_state
+        new_states = model_state.unit_states.copy()
+
+        if app in new_states:
+            raise RuntimeError(f"app {app} already in input ModelState")
+
+        if not leader_id:
+            leader_id = ids[0]
+            logger.debug(
+                f"no leader_id provided: leader will be {app.name}/{leader_id}"
+            )
+
+        new_states[app] = {
+            id_: state_template.replace(leader=(leader_id == id_)) for id_ in ids
+        }
+        new_model_state = model_state.replace(unit_states=new_states)
+
+        # set this first so that queue_setup_sequence will use it
+        self._model_state = new_model_state
+        self.queue_setup_sequence(app)
+
+        return new_model_state
 
     @property
     def _emitted_repr(self):
         return [f"{e[1].name}/{e[2]} :: {e[0].path}" for e in self._emitted]
+
+    def shuffle(self, respect_sequences: bool = True):
+        """In-place-shuffle self._event_queue."""
