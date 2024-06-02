@@ -175,7 +175,7 @@ class _QueueItem:
     _index: int = dataclasses.field(default_factory=lambda: next(_qitem_counter))
 
     def __repr__(self):
-        return f"Q<{self.event.name}({self.group or '-'}/{self._index})>"
+        return f"Q<{self.event.name}: {self.app.name}/{self.unit_id} ({self.group or '-'}/{self._index})>"
 
 
 class Catan:
@@ -277,7 +277,7 @@ class Catan:
         self._current_group = None
         logger.debug(f"exiting group sequence {self._fixed_sequence_counter}")
 
-    def _get_next_queue_item(self):
+    def _get_next_queue_item(self) -> _QueueItem:
         if self._event_queue:
             return self._event_queue.pop(0)
 
@@ -402,6 +402,134 @@ class Catan:
             self._reconcile_integration(model_state_out, i, app, unit_id)
         return model_state_out
 
+    @staticmethod
+    def _find_relation(
+        state: scenario.State, local_binding: Binding, remote_binding: Binding
+    ):
+        others = []
+        found = None
+        for rel in state.relations:
+            if (
+                rel.remote_app_name == remote_binding.app.name
+                and rel.endpoint == local_binding.endpoint
+            ) or (rel.endpoint == local_binding.endpoint):
+                if found:
+                    raise RuntimeError("found one already")
+                found = rel
+            else:
+                others.append(rel)
+
+        if not found:
+            raise RuntimeError(
+                f"relation {local_binding.endpoint} -> {remote_binding.app.name}:"
+                f"{remote_binding.endpoint} not found in state"
+            )
+        return found, others
+
+    def _sync_integration(
+        self,
+        unit_id: int,
+        model_state_out: ModelState,
+        states_from: Dict[int, scenario.State],
+        binding_from: Binding,
+        binding_to: Binding,
+        queue: bool,
+    ):
+        # simplifying a bit:
+        # if b1's local app data is different from b2's remote app data:
+        # copy it over and notify all b2 apps of the change in remote app data
+
+        # we assume that every state transition only touches a single state: namely that of the
+        # unit that has just executed.
+
+        # ``unit_id`` is the unit that's made changes to the state.
+        # If not given, it means we're doing an initial sync (not as a consequence of a
+        # specific charm executing) and so any unit of the provider app will do.
+        # this ASSUMES that all input states will be equivalent so far as the relation is concerned.
+        master_state = states_from[unit_id]
+        relation_from, other_relations_from = self._find_relation(
+            master_state, binding_from, binding_to
+        )
+
+        if master_state.leader:
+            # If the leader has made changes to the app databag, we need to notify the peers
+            new_states_from = {unit_id: master_state}
+
+            for peer_unit_id, peer_state in model_state_out.unit_states[
+                binding_from.app
+            ].items():
+                if peer_unit_id == unit_id:
+                    continue
+                peer_rel_from, other_peer_relations_from = self._find_relation(
+                    peer_state, binding_from, binding_to
+                )
+
+                # check if app data has changed
+                if peer_rel_from.local_app_data != relation_from.local_app_data:
+                    new_peer_rel_from = peer_rel_from.replace(
+                        local_app_data=relation_from.local_app_data
+                    )
+                    new_peer_state = peer_state.replace(
+                        relations=other_peer_relations_from + [new_peer_rel_from]
+                    )
+                    # if queue:
+                    #     self.queue(
+                    #         new_peer_rel_from.changed_event,
+                    #         binding_from.app,
+                    #         peer_unit_id,
+                    #     )
+                else:
+                    new_peer_state = peer_state
+
+                new_states_from[peer_unit_id] = new_peer_state
+
+        else:
+            # follower unit can only have changed unit databags, which won't notify the peers
+            # we only need to notify the remotes.
+            new_states_from = states_from
+
+        new_states_to = {}
+        any_changed = False
+
+        for remote_unit_id, remote_state in model_state_out.unit_states[
+            binding_to.app
+        ].items():
+            remote_rel_from, other_remote_relations_from = self._find_relation(
+                remote_state, binding_to, binding_from
+            )
+
+            new_remote_units_data = remote_rel_from.remote_units_data
+            new_remote_units_data[unit_id] = relation_from.local_unit_data
+
+            if (
+                # unit data changed
+                remote_rel_from.remote_units_data
+                != new_remote_units_data
+            ) or (
+                # app data changed
+                remote_rel_from.remote_app_data
+                != relation_from.local_app_data
+            ):
+                new_remote_rel_from = remote_rel_from.replace(
+                    remote_units_data=new_remote_units_data,
+                    remote_app_data=relation_from.local_app_data,
+                )
+                new_state_to = remote_state.replace(
+                    relations=other_remote_relations_from + [new_remote_rel_from]
+                )
+                any_changed = new_remote_rel_from
+            else:
+                new_state_to = remote_state
+
+            new_states_to[remote_unit_id] = new_state_to
+
+        if any_changed and queue:
+            # if one has changed, they all have.
+            self.queue(any_changed.changed_event, binding_to.app)
+
+        model_state_out.unit_states[binding_from.app] = new_states_from
+        model_state_out.unit_states[binding_to.app] = new_states_to
+
     def _reconcile_integration(
         self,
         model_state_out: "ModelState",
@@ -411,76 +539,21 @@ class Catan:
         queue: Optional[bool] = True,
     ):
         """Sync this integration's bindings and queue any events on Catan."""
-
-        def _sync(states_from, states_to, binding_from: Binding, binding_to: Binding):
-            # simplifying a bit:
-            # if b1's local app data is different from b2's remote app data:
-            # copy it over and notify all b2 apps of the change in remote app data
-
-            # this is the unit that's made changes to the state.
-            # If not given, it means we're doing an initial sync (not as a consequence of a
-            # specific charm executing) and so any unit will do.
-            # this ASSUMES that all input states will be equivalent.
-            master_state = states_from[unit_id or 0]
-            any_b1_relation = master_state.get_relations(binding_from.endpoint)[0]
-
-            # not nice, but inevitable?
-            any_b2_state = next(iter(states_to.values()))
-            any_b2_relation = any_b2_state.get_relations(binding_to.endpoint)[0]
-
-            if any_b1_relation.local_app_data == any_b2_relation.remote_app_data:
-                # no changes!
-                logger.debug("nothing to sync: relation data didn't change")
-                return
-
-            # copy over all relations; the one this endpoint is about would be enough,
-            # but we don't quite care as the rest shouldn't have changed either.
-            new_states_1 = {
-                uid: follower_state.replace(relations=master_state.relations)
-                for uid, follower_state in states_from.items()
-            }
-            # we copy the local app data of any relation in the master state
-            local_app_data = any_b1_relation.local_app_data
-            # todo sync unit data
-
-            # now we copy the local app data of the master state into the remote app data of each state
-            # of the remote app
-            # any state will do, they should all be
-            # the same where the relation is concerned
-            # all relations in binding_to stay the same for other endpoints, but for
-            # the binding_to endpoint that's being changed,
-            # we replace remote app data with binding_from's local app data.
-            any_state_to = next(iter(states_to.values()))
-            new_relations_b2 = [
-                r for r in any_state_to.relations if r.endpoint != binding_to.endpoint
-            ] + [
-                r.replace(remote_app_data=local_app_data)
-                for r in any_state_to.relations
-                if r.endpoint == binding_to.endpoint
-            ]
-            new_states_2 = {
-                uid: unit_state.replace(relations=new_relations_b2)
-                for uid, unit_state in states_to.items()
-            }
-
-            model_state_out.unit_states[binding_from.app] = new_states_1
-            model_state_out.unit_states[binding_to.app] = new_states_2
-
-            if queue:
-                self.queue(any_b2_relation.changed_event, binding_to.app)
-
-        # we assume that every state transition only touches a single state: namely that of
-        # app/unit.
+        unit_id = unit_id or 0
 
         b1, b2 = integration.binding1, integration.binding2
         states_out_b1 = model_state_out.unit_states[b1.app]
         states_out_b2 = model_state_out.unit_states[b2.app]
 
         if app is None or app == b1.app:
-            _sync(states_out_b1, states_out_b2, b1, b2)
+            self._sync_integration(
+                unit_id, model_state_out, states_out_b1, b1, b2, queue=queue
+            )
 
         if app is None or app == b2.app:
-            _sync(states_out_b2, states_out_b1, b2, b1)
+            self._sync_integration(
+                unit_id, model_state_out, states_out_b2, b2, b1, queue=queue
+            )
 
     def _final_sync(self, model_state: ModelState):
         """Bring the Integrations in sync with what's in the model's unit states."""
@@ -510,19 +583,19 @@ class Catan:
             # todo check this!
             # the only thing we need to sync up is the local units data
             # (because scenario.Relation doesn't keep track of peers' unit data)
-            any_b1_relation = list(b1_relations.values())[0]
+            relation_from = list(b1_relations.values())[0]
             any_b2_relation = list(b2_relations.values())[0]
 
             new_integrations.append(
                 Integration(
                     i.binding1.replace(
-                        local_app_data=any_b1_relation.local_app_data,
-                        remote_app_data=any_b1_relation.remote_app_data,
+                        local_app_data=relation_from.local_app_data,
+                        remote_app_data=relation_from.remote_app_data,
                         local_units_data={
                             unit: rel.local_unit_data
                             for unit, rel in b1_relations.items()
                         },
-                        remote_units_data=any_b1_relation.remote_units_data,
+                        remote_units_data=relation_from.remote_units_data,
                     ),
                     i.binding2.replace(
                         local_app_data=any_b2_relation.local_app_data,
