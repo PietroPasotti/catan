@@ -16,9 +16,9 @@ from typing import (
     Optional,
     Sequence,
     Tuple,
+    Type,
     Union,
     cast,
-    Type,
 )
 
 import scenario  # pyright: ignore[reportMissingImports]
@@ -41,7 +41,7 @@ class App(_DCBase):
         charm_type: Type[CharmBase],
         name: Optional[str] = None,
         patches: Any = None,
-        meta: Dict[str, Any] = None,
+        meta: Optional[Dict[str, Any]] = None,
     ):
         if patches:
             for patch in patches:
@@ -199,7 +199,9 @@ class _QueueItem:
     group: Optional[int]
     _index: int = dataclasses.field(default_factory=lambda: next(_qitem_counter))
 
-    def __eq__(self, other: "_QueueItem"):  # noqa
+    def __eq__(  # pyright: ignore[reportIncompatibleMethodOverride]
+        self, other: "_QueueItem"
+    ):
         return (
             self.event.name == other.event.name
             # todo: any other event attr we should use here?
@@ -211,7 +213,7 @@ class _QueueItem:
         )
 
     def __repr__(self):
-        return f"Q<{self.event.name}: {self.app.name}/{self.unit_id} ({self.group or '-'}/{self._index})>"
+        return f"Q<{self.event.name}: {getattr(self.app, 'name')}/{self.unit_id} ({self.group or '-'}/{self._index})>"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -328,7 +330,7 @@ class Catan:
         self._current_group = None
         logger.debug(f"exiting group sequence {self._fixed_sequence_counter}")
 
-    def _get_next_queue_item(self) -> _QueueItem:
+    def _get_next_queue_item(self) -> Optional[_QueueItem]:
         if self._event_queue:
             return self._event_queue.pop(0)
 
@@ -337,7 +339,7 @@ class Catan:
         """Inspect all events that have been emitted so far by this Catan."""
         return self._emitted
 
-    def settle(self, steps: int = None) -> ModelState:
+    def settle(self, steps: Optional[int] = None) -> ModelState:
         """Settle Catan."""
         model_state = self._initial_sync()
 
@@ -561,12 +563,10 @@ class Catan:
 
             if (
                 # unit data changed
-                remote_rel_from.remote_units_data
-                != new_remote_units_data
+                remote_rel_from.remote_units_data != new_remote_units_data
             ) or (
                 # app data changed
-                remote_rel_from.remote_app_data
-                != relation_from.local_app_data
+                remote_rel_from.remote_app_data != relation_from.local_app_data
             ):
                 new_remote_rel_from = remote_rel_from.replace(
                     remote_units_data=new_remote_units_data,
@@ -594,7 +594,7 @@ class Catan:
         integration: Integration,
         app: Optional["App"] = None,
         unit_id: Optional[int] = None,
-        queue: Optional[bool] = True,
+        queue: bool = True,
     ):
         """Sync this integration's bindings and queue any events on Catan."""
         unit_id = unit_id or 0
@@ -1022,7 +1022,9 @@ class Catan:
                 else ""
             )
 
-            out.append(f"{e.app.name}/{e.unit_id} :: {e.event.path}{remote_unit}")
+            out.append(
+                f"{cast(App,e.app).name}/{e.unit_id} :: {e.event.path}{remote_unit}"
+            )
         return out
 
     @property
@@ -1035,7 +1037,9 @@ class Catan:
                 if e.event.relation_remote_unit_id is not None
                 else ""
             )
-            out.append(f"{e.app.name}/{e.unit_id} :: {e.event.path}{remote_unit}")
+            out.append(
+                f"{cast(App, e.app).name}/{e.unit_id} :: {e.event.path}{remote_unit}"
+            )
         return out
 
     def shuffle(self, respect_sequences: bool = True):
