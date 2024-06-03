@@ -547,8 +547,6 @@ def test_imatrix_fill(tempo, tempo_state, traefik, traefik_state):
         "tempo/1 :: ingress_relation_changed",
         "tempo/0 :: tracing_relation_changed",
         "tempo/1 :: tracing_relation_changed",
-        "tempo/0 :: ingress_relation_changed",
-        "tempo/1 :: ingress_relation_changed",
         "traefik/0 :: tracing_relation_changed",
         "traefik/0 :: traefik_route_relation_changed",
     ]

@@ -8,7 +8,18 @@ from functools import partial
 from importlib import import_module
 from itertools import chain, count
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union, cast
+from typing import (
+    Any,
+    Dict,
+    Iterable,
+    List,
+    Optional,
+    Sequence,
+    Tuple,
+    Union,
+    cast,
+    Type,
+)
 
 import scenario  # pyright: ignore[reportMissingImports]
 from ops import CharmBase
@@ -24,6 +35,23 @@ class App(_DCBase):
     charm: _CharmSpec
     leader_id: Optional[int] = None
     alias: Optional[str] = None
+
+    @staticmethod
+    def from_charm(
+        charm_type: Type[CharmBase],
+        name: Optional[str] = None,
+        patches: Any = None,
+        meta: Dict[str, Any] = None,
+    ):
+        if patches:
+            for patch in patches:
+                patch.__enter__()
+        if meta:
+            spec = _CharmSpec(charm_type, meta=meta)
+        else:
+            spec = _CharmSpec.autoload(charm_type)
+
+        return App(spec, alias=name or spec.meta["name"])
 
     @staticmethod
     def from_path(
@@ -97,6 +125,9 @@ class Binding(_DCBase):
 
     app: App
     endpoint: str
+    relation_id: int = dataclasses.field(
+        default_factory=scenario.state.next_relation_id
+    )
 
     local_app_data: Dict[str, str] = dataclasses.field(default_factory=dict)
     remote_app_data: Dict[str, str] = dataclasses.field(default_factory=dict)
@@ -130,20 +161,14 @@ class Integration(_DCBase):
             scenario.Relation(
                 endpoint=self.binding1.endpoint,
                 remote_app_name=self.binding2.app.name,
+                relation_id=self.binding1.relation_id,
             ),
             scenario.Relation(
                 endpoint=self.binding2.endpoint,
                 remote_app_name=self.binding1.app.name,
+                relation_id=self.binding2.relation_id,
             ),
         )
-
-
-@dataclasses.dataclass(frozen=True)
-class _HistoryItem(_DCBase):
-    event: scenario.Event
-    app: App
-    unit_id: int
-    state_out: scenario.State
 
 
 @dataclasses.dataclass(frozen=True)
@@ -174,8 +199,25 @@ class _QueueItem:
     group: Optional[int]
     _index: int = dataclasses.field(default_factory=lambda: next(_qitem_counter))
 
+    def __eq__(self, other: "_QueueItem"):  # noqa
+        return (
+            self.event.name == other.event.name
+            # todo: any other event attr we should use here?
+            and self.event.relation_remote_unit_id
+            == other.event.relation_remote_unit_id
+            and self.app == other.app
+            and self.unit_id == other.unit_id
+            and self.group == other.group
+        )
+
     def __repr__(self):
         return f"Q<{self.event.name}: {self.app.name}/{self.unit_id} ({self.group or '-'}/{self._index})>"
+
+
+@dataclasses.dataclass(frozen=True)
+class _HistoryItem(_DCBase):
+    item: _QueueItem
+    state_out: scenario.State
 
 
 class Catan:
@@ -223,8 +265,17 @@ class Catan:
 
         qitem = _QueueItem(event, app, unit_id, group=self._current_group)
         expanded = self._expand_queue_item(model_state, qitem)
-        self._event_queue.extend(expanded)
+        self._extend_event_queue(expanded)
         return expanded
+
+    def _extend_event_queue(self, expanded: Iterable[_QueueItem]):
+        """Add to the end of the event queue, avoiding duplicates."""
+        eq = self._event_queue
+        for item in expanded:
+            if item in eq:
+                logger.debug(f"skipped {item} as it's already in queue.")
+                continue
+            eq.append(item)
 
     def _expand_queue_item(
         self, model_state: ModelState, item: _QueueItem
@@ -286,7 +337,7 @@ class Catan:
         """Inspect all events that have been emitted so far by this Catan."""
         return self._emitted
 
-    def settle(self) -> ModelState:
+    def settle(self, steps: int = None) -> ModelState:
         """Settle Catan."""
         model_state = self._initial_sync()
 
@@ -303,9 +354,14 @@ class Catan:
             app = cast(App, item.app)
             unit_id = cast(int, item.unit_id)
 
-            ms_out = self._fire(model_state, item.event, app, unit_id)
+            ms_out, unit_state_out = self._fire(model_state, item.event, app, unit_id)
+            self._emitted.append(_HistoryItem(item, unit_state_out))
+
             ms_out_synced = self._model_reconcile(ms_out, app, unit_id)
             model_state = ms_out_synced
+
+            if steps and i >= steps:
+                break
 
         if i == 0:
             logger.warning(
@@ -346,7 +402,7 @@ class Catan:
         event: scenario.Event,
         app: App,
         unit_id: int,
-    ) -> ModelState:
+    ) -> Tuple[ModelState, scenario.State]:
         logger.info(f"firing {event} on {app}:{unit_id}")
         # don't mutate: replace.
         ms_out = model_state.copy()
@@ -366,13 +422,11 @@ class Catan:
 
         state_out = self._run_scenario(app, unit_id, state_in, event)
 
-        self._emitted.append(_HistoryItem(event, app, unit_id, state_out))
-
         if not dead_unit:
             units[unit_id] = state_out  # pyright: ignore[reportUnboundVariable]
             ms_out.unit_states[app] = units  # pyright: ignore[reportUnboundVariable]
 
-        return ms_out
+        return ms_out, state_out
 
     def _initial_sync(self) -> ModelState:
         """Bring the unit states in sync with what's in the Integrations."""
@@ -472,6 +526,9 @@ class Catan:
                     new_peer_state = peer_state.replace(
                         relations=other_peer_relations_from + [new_peer_rel_from]
                     )
+                    # FIXME: unclear why this is NOT needed:
+                    #  it results in duplicate events in the queue, but I'd
+                    #  expect this to be necessary to trigger events in the peers
                     # if queue:
                     #     self.queue(
                     #         new_peer_rel_from.changed_event,
@@ -498,7 +555,8 @@ class Catan:
                 remote_state, binding_to, binding_from
             )
 
-            new_remote_units_data = remote_rel_from.remote_units_data
+            # copy or we'll be mutating in-place
+            new_remote_units_data = remote_rel_from.remote_units_data.copy()
             new_remote_units_data[unit_id] = relation_from.local_unit_data
 
             if (
@@ -580,7 +638,6 @@ class Catan:
                 ][0]
 
             # local and remote app data, and remote units data should be in sync already
-            # todo check this!
             # the only thing we need to sync up is the local units data
             # (because scenario.Relation doesn't keep track of peers' unit data)
             relation_from = list(b1_relations.values())[0]
@@ -648,6 +705,7 @@ class Catan:
                 local_units_data={
                     uid: {} for uid in self.model_state.unit_states[app1]
                 },
+                relation_id=scenario.state.next_relation_id(),
             ),
             Binding(
                 app2,
@@ -655,6 +713,7 @@ class Catan:
                 local_units_data={
                     uid: {} for uid in self.model_state.unit_states[app2]
                 },
+                relation_id=scenario.state.next_relation_id(),
             ),
         )
         return self._add_integration(integration)
@@ -912,11 +971,16 @@ class Catan:
 
         return new_model_state
 
+    def clear_queue(self):
+        """Delete all items from the queue."""
+        self._event_queue.clear()
+        logger.info("Event queue cleared.")
+
     def deploy(
         self,
         app: App,
-        ids: Sequence[int],
-        state_template: scenario.State,
+        ids: Optional[Sequence[int]] = None,
+        state_template: Optional[scenario.State] = None,
         leader_id: Optional[int] = None,
     ):
         """Deploy an app."""
@@ -926,14 +990,17 @@ class Catan:
         if app in new_states:
             raise RuntimeError(f"app {app} already in input ModelState")
 
+        _ids = cast(List[int], ids or [0])
+
         if not leader_id:
-            leader_id = ids[0]
+            leader_id = _ids[0]
             logger.debug(
                 f"no leader_id provided: leader will be {app.name}/{leader_id}"
             )
 
+        base_state = state_template or scenario.State()
         new_states[app] = {
-            id_: state_template.replace(leader=(leader_id == id_)) for id_ in ids
+            _id: base_state.replace(leader=(leader_id == _id)) for _id in _ids
         }
         new_model_state = model_state.replace(unit_states=new_states)
 
@@ -947,13 +1014,27 @@ class Catan:
     def _emitted_repr(self):
         """Utility to summarize the events that have been emitted by this Catan."""
         out = []
-        for e in self._emitted:
+        for emitted in self._emitted:
+            e = emitted.item
             remote_unit = (
                 f"({e.event.relation.remote_app_name}/{e.event.relation_remote_unit_id})"
                 if e.event.relation_remote_unit_id is not None
                 else ""
             )
 
+            out.append(f"{e.app.name}/{e.unit_id} :: {e.event.path}{remote_unit}")
+        return out
+
+    @property
+    def _queue_repr(self):
+        """Utility to summarize the current event queue."""
+        out = []
+        for e in self._event_queue:
+            remote_unit = (
+                f"({e.event.relation.remote_app_name}/{e.event.relation_remote_unit_id})"
+                if e.event.relation_remote_unit_id is not None
+                else ""
+            )
             out.append(f"{e.app.name}/{e.unit_id} :: {e.event.path}{remote_unit}")
         return out
 
