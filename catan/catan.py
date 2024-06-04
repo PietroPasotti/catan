@@ -1,7 +1,10 @@
 import dataclasses
 import logging
 import random
+import shlex
+import subprocess
 import sys
+import tempfile
 from collections import defaultdict
 from contextlib import contextmanager
 from functools import partial
@@ -33,8 +36,9 @@ class App(_DCBase):
     """Application."""
 
     charm: _CharmSpec
-    leader_id: Optional[int] = None
+    """Charm that this app deploys."""
     alias: Optional[str] = None
+    """Name with which this app is deployed to juju."""
 
     @staticmethod
     def from_charm(
@@ -59,6 +63,71 @@ class App(_DCBase):
     ):
         """Load app from local path."""
         charm_root = Path(path)
+        if not charm_root.exists():
+            raise RuntimeError(
+                f"{charm_root} not found: cannot import charm from path."
+            )
+        sources_roots = tuple(
+            map(
+                str,
+                [
+                    charm_root / "src",
+                    charm_root / "lib",
+                ],
+            )
+        )
+        sys.path.extend(sources_roots)
+
+        if patches:
+            for patch in patches:
+                patch.__enter__()
+
+        module = import_module("charm")
+        for sroot in sources_roots:
+            sys.path.remove(sroot)
+
+        charm_type = [
+            t
+            for t in module.__dict__.values()
+            if isinstance(t, type)
+            and issubclass(t, CharmBase)
+            and not t.__name__ == "CharmBase"
+        ]
+
+        if not charm_type:
+            raise RuntimeError(f"No charm could be loaded from {module}.")
+        if len(charm_type) > 1:
+            raise RuntimeError(f"Too many charms found in {module}: {charm_type}")
+
+        spec = _CharmSpec.autoload(charm_type[0])
+
+        # unimport charm else the next 'import' will pick it up again
+        sys.modules.pop("charm")
+        return App(spec, alias=name or spec.meta["name"])
+
+    @staticmethod
+    def from_git(
+        org: str,
+        repo_name: str,
+        name: Optional[str] = None,
+        patches: Any = None,
+        branch: Optional[str] = None,
+    ):
+        """Load app from a git repo."""
+        url = f"git@github.com:{org}/{repo_name}"
+
+        destination = tempfile.TemporaryDirectory(delete=False)
+        _branch = f" --branch {branch}" if branch else ""
+        cmd = f"git clone {url} --depth 1{_branch} {destination.name}"
+
+        try:
+            subprocess.check_call(shlex.split(cmd))
+        except subprocess.CalledProcessError as e:
+            raise RuntimeError(
+                f"failed cloning {url}@{branch if branch else 'main'} with {cmd!r}"
+            ) from e
+
+        charm_root = Path(destination.name)
         if not charm_root.exists():
             raise RuntimeError(
                 f"{charm_root} not found: cannot import charm from path."
@@ -308,16 +377,6 @@ class Catan:
 
         return chain(*map(partial(_expand, model_state), [item]))
 
-        # def _sorting(elem: _QueueItem):
-        #     # sort by group event priority, then app name, then unit ID.
-        #     # app name and unit ID could be ignored, but we like things deterministic
-        #     return (-self._get_priority(elem.event), elem.app.name, elem.unit_id)
-        #
-        # if self._queue_sorting:
-        #     final = sorted(expanded, key=_sorting)
-        # else:
-        #     final = list(expanded)
-
     @contextmanager
     def fixed_sequence(self):
         """Keep together any events queued within this context."""
@@ -393,6 +452,7 @@ class Catan:
             app_name=app.name,
             unit_id=unit_id,
         )
+
         if event._is_action_event:  # noqa
             return context.run_action(event.action, unit_state).state
         else:
@@ -563,10 +623,12 @@ class Catan:
 
             if (
                 # unit data changed
-                remote_rel_from.remote_units_data != new_remote_units_data
+                remote_rel_from.remote_units_data
+                != new_remote_units_data
             ) or (
                 # app data changed
-                remote_rel_from.remote_app_data != relation_from.local_app_data
+                remote_rel_from.remote_app_data
+                != relation_from.local_app_data
             ):
                 new_remote_rel_from = remote_rel_from.replace(
                     remote_units_data=new_remote_units_data,
@@ -678,14 +740,17 @@ class Catan:
         for relation, app, other_app in zip(
             integration.relations, integration.apps, reversed(integration.apps)
         ):
-            self._queue(ms_out, relation.created_event, app)
+            with self.fixed_sequence():
+                self._queue(ms_out, relation.created_event, app)
 
-            for remote_unit_id in ms_out.unit_states[other_app]:
-                self._queue(
-                    ms_out, relation.joined_event(remote_unit_id=remote_unit_id), app
-                )
+                for remote_unit_id in ms_out.unit_states[other_app]:
+                    self._queue(
+                        ms_out,
+                        relation.joined_event(remote_unit_id=remote_unit_id),
+                        app,
+                    )
 
-            self._queue(ms_out, relation.changed_event, app)
+                self._queue(ms_out, relation.changed_event, app)
 
         self._model_state = ms_out
         return ms_out
@@ -696,7 +761,7 @@ class Catan:
         endpoint1: str,
         app2: App,
         endpoint2: str,
-    ):
+    ) -> ModelState:
         """Integrate two apps."""
         integration = Integration(
             Binding(
@@ -733,14 +798,21 @@ class Catan:
                     other_app, self._dead_unit_states[other_app]
                 )
             )
-            for remote_unit_id in departing_units_ids:
-                self._queue(
-                    model_state,
-                    relation.departed_event(remote_unit_id=remote_unit_id),
-                    app,
-                )
 
-            self._queue(model_state, relation.broken_event, app)
+            local_unit_ids = list(model_state.unit_states[app])
+            # do this rather than queuing for the whole app, so we can preserve the internal
+            # ordering at the unit level: all that matters is that each unit sees 'broken' after 'departed',
+            # but we don't quite care that units start seeing 'broken' only after all 'departed' have been fired.
+            for unit_id in local_unit_ids:
+                with self.fixed_sequence():
+                    for remote_unit_id in departing_units_ids:
+                        self._queue(
+                            model_state,
+                            relation.departed_event(remote_unit_id=remote_unit_id),
+                            app,
+                            unit_id,
+                        )
+                    self._queue(model_state, relation.broken_event, app, unit_id)
 
         ms_out = model_state.replace(
             integrations=[i for i in model_state.integrations if i is not integration]
@@ -779,7 +851,7 @@ class Catan:
         self,
         action: Union[str, scenario.Action],
         app: App,
-        unit: Optional[int] = None,
+        unit: int,
     ):
         """Run an action on all units or a specific one."""
         if not isinstance(action, scenario.Action):
@@ -840,6 +912,7 @@ class Catan:
             raise RuntimeError(f"{app.name}/{unit} exists already in the model state")
 
         if state.leader:
+            # todo consider doing state.replace(leader=False) instead of raising
             raise RuntimeError("new units cannot join as leaders.")
 
         new_states[app][unit] = state
@@ -899,6 +972,21 @@ class Catan:
                     integrations.append(integration)
 
         return integrations
+
+    def configure(self, app: App, **_config):
+        """Update the app configuration."""
+        model_state = self._model_state
+        new_states = model_state.unit_states.copy()
+        new_states[app] = {
+            _id: _unit_state.replace(config={**_unit_state.config, **_config})
+            for _id, _unit_state in new_states[app].items()
+        }
+        new_model_state = model_state.replace(unit_states=new_states)
+
+        self._queue(new_model_state, "config-changed", app)
+
+        self._model_state = new_model_state
+        return new_model_state
 
     def remove_app(self, app: App):
         """Remove an app."""
@@ -979,6 +1067,7 @@ class Catan:
     def deploy(
         self,
         app: App,
+        # TODO: add --num-units options
         ids: Optional[Sequence[int]] = None,
         state_template: Optional[scenario.State] = None,
         leader_id: Optional[int] = None,
