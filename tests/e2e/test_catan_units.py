@@ -5,7 +5,16 @@ import pytest
 from ops.pebble import Layer
 from scenario import Container, Event, ExecOutput, Relation, State
 
-from catan.catan import App, Binding, Catan, Integration, ModelState, _QueueItem
+from catan.catan import (
+    App,
+    Binding,
+    Catan,
+    CatanError,
+    InconsistentStateError,
+    Integration,
+    ModelState,
+    _QueueItem,
+)
 
 
 @pytest.fixture
@@ -196,9 +205,9 @@ def test_queue(tempo, tempo_state, traefik, traefik_state, traefik_unit_id):
         # traefik notices tempo has published receiver urls
         f"traefik/{traefik_unit_id} :: tracing_relation_changed",
     ]
-    traefik_tracing_out = ms_out.unit_states[traefik][traefik_unit_id].get_relations(
-        "tracing"
-    )[0]
+
+    traefik_state: State = ms_out.unit_states[traefik][traefik_unit_id]
+    traefik_tracing_out = traefik_state.get_relations("tracing")[0]
     assert traefik_tracing_out.remote_app_data
 
 
@@ -265,8 +274,8 @@ def test_disintegrate(tempo, tempo_state, traefik, traefik_state):
 
     assert c._emitted_repr == [
         "tempo/0 :: tracing_relation_departed(traefik/0)",
-        "tempo/1 :: tracing_relation_departed(traefik/0)",
         "tempo/0 :: tracing_relation_broken",
+        "tempo/1 :: tracing_relation_departed(traefik/0)",
         "tempo/1 :: tracing_relation_broken",
         "traefik/0 :: tracing_relation_departed(tempo/0)",
         "traefik/0 :: tracing_relation_departed(tempo/1)",
@@ -290,13 +299,10 @@ def test_run_action(tempo, tempo_state, traefik, traefik_state):
     )
     c = Catan(ms)
 
-    c.run_action("show-proxied-endpoints", traefik)
+    c.run_action("show-proxied-endpoints", traefik, 1)
 
     c.settle()
-    assert c._emitted_repr == [
-        "traefik/1 :: show_proxied_endpoints_action",
-        "traefik/3 :: show_proxied_endpoints_action",
-    ]
+    assert c._emitted_repr == ["traefik/1 :: show_proxied_endpoints_action"]
 
 
 def test_deploy(tempo, tempo_state, traefik, traefik_state):
@@ -309,19 +315,20 @@ def test_deploy(tempo, tempo_state, traefik, traefik_state):
     )
     c = Catan(ms)
 
-    ms_trfk = c.deploy(traefik, ids=(1, 3), state_template=traefik_state)
+    ms_trfk = c.deploy(traefik, ids=(6, 3), state_template=traefik_state)
+
     assert ms_trfk.unit_states[traefik] == {
-        1: traefik_state.replace(leader=True),
+        6: traefik_state.replace(leader=True),
         3: traefik_state.replace(leader=False),
     }
 
     c.settle()
 
     assert c._emitted_repr == [
-        "traefik/1 :: install",
-        "traefik/1 :: leader_elected",
-        "traefik/1 :: config_changed",
-        "traefik/1 :: start",
+        "traefik/6 :: install",
+        "traefik/6 :: leader_elected",
+        "traefik/6 :: config_changed",
+        "traefik/6 :: start",
         "traefik/3 :: install",
         "traefik/3 :: leader_settings_changed",
         "traefik/3 :: config_changed",
@@ -343,6 +350,7 @@ def test_add_unit(tempo, tempo_state, traefik, traefik_state):
     c.settle()
 
     new_traefik_unit_state = traefik_state.replace(leader=False)
+
     ms_traefik_scaled = c.add_unit(traefik, 42, state=new_traefik_unit_state)
 
     assert set(ms_traefik_scaled.unit_states[traefik]) == {1, 3, 42}
@@ -447,8 +455,8 @@ def test_remove_related_app(tempo, tempo_state, traefik, traefik_state):
 
     assert c._emitted_repr == [
         "tempo/0 :: tracing_relation_departed(traefik/0)",
-        "tempo/1 :: tracing_relation_departed(traefik/0)",
         "tempo/0 :: tracing_relation_broken",
+        "tempo/1 :: tracing_relation_departed(traefik/0)",
         "tempo/1 :: tracing_relation_broken",
         "traefik/0 :: tracing_relation_departed(tempo/0)",
         "traefik/0 :: tracing_relation_departed(tempo/1)",
@@ -506,6 +514,39 @@ def test_shuffle_nonsequential(tempo, tempo_state, traefik, traefik_state):
         "traefik/1 :: config_changed",
         "traefik/1 :: install",
     ]
+
+
+def test_config(tempo, tempo_state, traefik, traefik_state):
+    ms = ModelState(
+        {
+            traefik: {
+                0: traefik_state.replace(leader=True),
+                2: traefik_state.replace(leader=False),
+            },
+        }
+    )
+    c = Catan(ms)
+    c.configure(traefik, external_hostname="foo.com")
+    c.settle()
+
+    assert c._emitted_repr == [
+        "traefik/0 :: config_changed",
+        "traefik/2 :: config_changed",
+    ]
+
+
+def test_config_bad_value(tempo, tempo_state, traefik, traefik_state):
+    ms = ModelState(
+        {
+            traefik: {
+                0: traefik_state.replace(leader=True),
+                2: traefik_state.replace(leader=False),
+            },
+        }
+    )
+    c = Catan(ms)
+    with pytest.raises(InconsistentStateError):
+        c.configure(traefik, gobble="dobble")
 
 
 def test_imatrix_fill(tempo, tempo_state, traefik, traefik_state):
