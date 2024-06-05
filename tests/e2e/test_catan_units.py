@@ -5,7 +5,16 @@ import pytest
 from ops.pebble import Layer
 from scenario import Container, Event, ExecOutput, Relation, State
 
-from catan.catan import App, Binding, Catan, Integration, ModelState, _QueueItem
+from catan.catan import (
+    App,
+    Binding,
+    Catan,
+    CatanError,
+    InconsistentStateError,
+    Integration,
+    ModelState,
+    _QueueItem,
+)
 
 
 @pytest.fixture
@@ -265,8 +274,8 @@ def test_disintegrate(tempo, tempo_state, traefik, traefik_state):
 
     assert c._emitted_repr == [
         "tempo/0 :: tracing_relation_departed(traefik/0)",
-        "tempo/1 :: tracing_relation_departed(traefik/0)",
         "tempo/0 :: tracing_relation_broken",
+        "tempo/1 :: tracing_relation_departed(traefik/0)",
         "tempo/1 :: tracing_relation_broken",
         "traefik/0 :: tracing_relation_departed(tempo/0)",
         "traefik/0 :: tracing_relation_departed(tempo/1)",
@@ -446,8 +455,8 @@ def test_remove_related_app(tempo, tempo_state, traefik, traefik_state):
 
     assert c._emitted_repr == [
         "tempo/0 :: tracing_relation_departed(traefik/0)",
-        "tempo/1 :: tracing_relation_departed(traefik/0)",
         "tempo/0 :: tracing_relation_broken",
+        "tempo/1 :: tracing_relation_departed(traefik/0)",
         "tempo/1 :: tracing_relation_broken",
         "traefik/0 :: tracing_relation_departed(tempo/0)",
         "traefik/0 :: tracing_relation_departed(tempo/1)",
@@ -505,6 +514,39 @@ def test_shuffle_nonsequential(tempo, tempo_state, traefik, traefik_state):
         "traefik/1 :: config_changed",
         "traefik/1 :: install",
     ]
+
+
+def test_config(tempo, tempo_state, traefik, traefik_state):
+    ms = ModelState(
+        {
+            traefik: {
+                0: traefik_state.replace(leader=True),
+                2: traefik_state.replace(leader=False),
+            },
+        }
+    )
+    c = Catan(ms)
+    c.configure(traefik, external_hostname="foo.com")
+    c.settle()
+
+    assert c._emitted_repr == [
+        "traefik/0 :: config_changed",
+        "traefik/2 :: config_changed",
+    ]
+
+
+def test_config_bad_value(tempo, tempo_state, traefik, traefik_state):
+    ms = ModelState(
+        {
+            traefik: {
+                0: traefik_state.replace(leader=True),
+                2: traefik_state.replace(leader=False),
+            },
+        }
+    )
+    c = Catan(ms)
+    with pytest.raises(InconsistentStateError):
+        c.configure(traefik, gobble="dobble")
 
 
 def test_imatrix_fill(tempo, tempo_state, traefik, traefik_state):

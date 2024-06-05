@@ -26,9 +26,27 @@ from typing import (
 
 import scenario  # pyright: ignore[reportMissingImports]
 from ops import CharmBase
+from scenario import consistency_checker
 from scenario.state import _CharmSpec, _DCBase  # pyright: ignore[reportMissingImports]
 
 logger = logging.getLogger("catan")
+JUJU_VERSION = (3, 4, 1)
+
+
+class CatanError(Exception):
+    """Base of the Catan exception hierarchy."""
+
+
+class InconsistentStateError(CatanError):
+    """Raised when a user operation on Catan would result in an inconsistent state."""
+
+
+class NotFoundError(CatanError):
+    """Raised when a user operation on Catan attempts to manipulate an object that is not in the model state."""
+
+
+class InvalidOperationError(CatanError):
+    """Raised when a user operation on Catan would make the model state inconsistent."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -116,7 +134,7 @@ class App(_DCBase):
         """Load app from a git repo."""
         url = f"git@github.com:{org}/{repo_name}"
 
-        destination = tempfile.TemporaryDirectory(delete=False)
+        destination = tempfile.TemporaryDirectory()
         _branch = f" --branch {branch}" if branch else ""
         cmd = f"git clone {url} --depth 1{_branch} {destination.name}"
 
@@ -278,11 +296,12 @@ class _QueueItem:
             == other.event.relation_remote_unit_id
             and self.app == other.app
             and self.unit_id == other.unit_id
-            and self.group == other.group
+            # ignore group in equality check
+            # and self.group == other.group
         )
 
     def __repr__(self):
-        return f"Q<{self.event.name}: {getattr(self.app, 'name')}/{self.unit_id} ({self.group or '-'}/{self._index})>"
+        return f"Q<{self.event.name}: {getattr(self.app, 'name')}/{self.unit_id} ({self.group or '~'})>"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -478,7 +497,7 @@ class Catan:
                 state_in = self._dead_unit_states[app][unit_id]
                 dead_unit = True
             except KeyError:
-                raise RuntimeError(
+                raise NotFoundError(
                     f"{app}/{unit_id} not found in current model_state or dead_units_states."
                 ) from e
 
@@ -536,7 +555,7 @@ class Catan:
                 others.append(rel)
 
         if not found:
-            raise RuntimeError(
+            raise NotFoundError(
                 f"relation {local_binding.endpoint} -> {remote_binding.app.name}:"
                 f"{remote_binding.endpoint} not found in state"
             )
@@ -733,7 +752,11 @@ class Catan:
         return ms_out
 
     def _add_integration(self, integration: Integration):
-        """Add an integration to the model."""
+        """Add an integration to the model.
+
+        This method will NOT validate that the interface you're creating is valid.
+        Caller's responsibility.
+        """
         ms_out = self._model_state.replace(
             integrations=self._model_state.integrations + [integration]
         )
@@ -755,6 +778,34 @@ class Catan:
         self._model_state = ms_out
         return ms_out
 
+    def _get_interfaces(
+        self, apps: Iterable[App]
+    ) -> Tuple[Dict[str, List[Tuple[App, str]]], Dict[str, List[Tuple[App, str]]]]:
+        # Get a mapping from all supported interfaces in the current model to the list of
+        #  app:endpoint pairs that support them. Split by provider and requirer
+
+        # mapping from apps to interfaces to endpoints
+        providers = {}
+        requirers = {}
+
+        pool = apps or list(self._model_state.unit_states)
+
+        for _app in pool:
+            # mapping from interfaces to app, endpoint pairs
+            providers_from_app = defaultdict(list)
+            for endpoint, ep_meta in _app.charm.meta.get("provides", {}).items():
+                providers_from_app[ep_meta["interface"]].append((_app, endpoint))
+            providers.update(providers_from_app)
+
+            requirers_from_app = defaultdict(list)
+            for endpoint, ep_meta in _app.charm.meta.get("requires", {}).items():
+                requirers_from_app[ep_meta["interface"]].append((_app, endpoint))
+            requirers.update(requirers_from_app)
+
+        # interfaces that have both a requirer and a provider in the pool of apps under consideration
+        # sorting is to make our lives easier in testing
+        return providers, requirers
+
     def integrate(
         self,
         app1: App,
@@ -763,6 +814,33 @@ class Catan:
         endpoint2: str,
     ) -> ModelState:
         """Integrate two apps."""
+
+        # check that they can be integrated.
+        found = None
+        providers, requirers = self._get_interfaces((app1, app2))
+        for shared_interface in set(providers).intersection(set(requirers)):
+            for _, prov_ep in providers[shared_interface]:
+                for _, req_ep in requirers[shared_interface]:
+                    if prov_ep == endpoint1 and req_ep == endpoint2:
+                        found = shared_interface
+                        break
+                    elif prov_ep == endpoint2 and req_ep == endpoint1:
+                        found = shared_interface
+                        break
+
+        if found:
+            logger.debug(
+                f"Found shared interface {found}: creating integration "
+                f"{app1.name}:{endpoint1} --> {app2.name}:{endpoint2}"
+            )
+
+        else:
+            raise InvalidOperationError(
+                f"cannot relate {app1.name}:{endpoint1!r} --> {app2.name}:{endpoint2!r}. "
+                f"Please check that the endpoint names are correct and the "
+                f"interface they declare is the same."
+            )
+
         integration = Integration(
             Binding(
                 app1,
@@ -798,12 +876,13 @@ class Catan:
                     other_app, self._dead_unit_states[other_app]
                 )
             )
-
-            local_unit_ids = list(model_state.unit_states[app])
+            local_units_ids = list(
+                model_state.unit_states.get(app, self._dead_unit_states[app])
+            )
             # do this rather than queuing for the whole app, so we can preserve the internal
             # ordering at the unit level: all that matters is that each unit sees 'broken' after 'departed',
             # but we don't quite care that units start seeing 'broken' only after all 'departed' have been fired.
-            for unit_id in local_unit_ids:
+            for unit_id in local_units_ids:
                 with self.fixed_sequence():
                     for remote_unit_id in departing_units_ids:
                         self._queue(
@@ -843,7 +922,7 @@ class Catan:
                 break
 
         if not to_remove:
-            raise RuntimeError(f"Integration not found: {app1}:{endpoint} --> {app2}")
+            raise NotFoundError(f"Integration not found: {app1}:{endpoint} --> {app2}")
 
         return to_remove
 
@@ -909,11 +988,13 @@ class Catan:
         new_states = model_state.unit_states.copy()
 
         if unit in new_states[app]:
-            raise RuntimeError(f"{app.name}/{unit} exists already in the model state")
+            raise InvalidOperationError(
+                f"{app.name}/{unit} exists already in the model state"
+            )
 
         if state.leader:
             # todo consider doing state.replace(leader=False) instead of raising
-            raise RuntimeError("new units cannot join as leaders.")
+            raise InvalidOperationError("new units cannot join as leaders.")
 
         new_states[app][unit] = state
         new_model_state = model_state.replace(unit_states=new_states)
@@ -938,32 +1019,14 @@ class Catan:
     def imatrix_fill(self, *app: App) -> List[Integration]:
         """Cross-relate all that's relatable (only including *app)."""
 
-        # mapping from apps to interfaces to endpoints
-        providers = {}
-        requirers = {}
-
-        pool = app or list(self._model_state.unit_states)
-
-        for _app in pool:
-            # mapping from interfaces to app, endpoint pairs
-            providers_from_app = defaultdict(list)
-            for endpoint, ep_meta in _app.charm.meta.get("provides", {}).items():
-                providers_from_app[ep_meta["interface"]].append((_app, endpoint))
-            providers.update(providers_from_app)
-
-            requirers_from_app = defaultdict(list)
-            for endpoint, ep_meta in _app.charm.meta.get("requires", {}).items():
-                requirers_from_app[ep_meta["interface"]].append((_app, endpoint))
-            requirers.update(requirers_from_app)
-
         # interfaces that have both a requirer and a provider in the pool of apps under consideration
-        # sorting is to make our lives easier in testing
-        shared_interfaces = sorted(set(providers).intersection(set(requirers)))
+        providers, requirers = self._get_interfaces(apps=app)
 
         integrations = []
-        for interface in shared_interfaces:
-            for prov_app, prov_ep in providers[interface]:
-                for req_app, req_ep in requirers[interface]:
+        # sorting is to make our lives easier in testing
+        for shared_interface in sorted(set(providers).intersection(set(requirers))):
+            for prov_app, prov_ep in providers[shared_interface]:
+                for req_app, req_ep in requirers[shared_interface]:
                     integration = Integration(
                         Binding(prov_app, prov_ep),
                         Binding(req_app, req_ep),
@@ -973,14 +1036,45 @@ class Catan:
 
         return integrations
 
+    def _consistency_check(
+        self, cc_output: consistency_checker.Results, operation: str
+    ):
+        errors, warnings = cc_output
+        if errors:
+            raise InconsistentStateError(
+                f"Operation {operation!r} not allowed: it would result in an inconsistent state.",
+                errors,
+            )
+
+        if warnings:
+            logger.warning(
+                f"Warnings found checking the consistency of the proposed state after operation "
+                f"{operation!r}: {warnings}"
+            )
+
     def configure(self, app: App, **_config):
         """Update the app configuration."""
         model_state = self._model_state
         new_states = model_state.unit_states.copy()
-        new_states[app] = {
-            _id: _unit_state.replace(config={**_unit_state.config, **_config})
-            for _id, _unit_state in new_states[app].items()
-        }
+        new_unit_states = {}
+        for _id, _unit_state in new_states[app].items():
+            new_unit_state = _unit_state.replace(
+                config={**_unit_state.config, **_config}
+            )
+
+            self._consistency_check(
+                consistency_checker.check_config_consistency(
+                    state=new_unit_state,
+                    charm_spec=app.charm,
+                    juju_version=JUJU_VERSION,
+                ),
+                operation=f"configure {app.name} {_config}",
+            )
+
+            new_unit_states[_id] = new_unit_state
+
+        new_states[app] = new_unit_states
+
         new_model_state = model_state.replace(unit_states=new_states)
 
         self._queue(new_model_state, "config-changed", app)
@@ -994,7 +1088,7 @@ class Catan:
         new_states = model_state.unit_states.copy()
 
         if app not in new_states:
-            raise RuntimeError(f"app {app} not in ModelState")
+            raise NotFoundError(f"app {app} not in ModelState")
 
         all_unit_states = new_states.pop(app)
         # in case we've previously killed some units of this app:
@@ -1027,7 +1121,7 @@ class Catan:
         new_states = model_state.unit_states.copy()
 
         if app not in new_states:
-            raise RuntimeError(f"app {app} not in ModelState")
+            raise NotFoundError(f"app {app} not in ModelState")
 
         unit_state = new_states[app].pop(unit)
         self._dead_unit_states[app][unit] = unit_state
@@ -1077,7 +1171,7 @@ class Catan:
         new_states = model_state.unit_states.copy()
 
         if app in new_states:
-            raise RuntimeError(f"app {app} already in input ModelState")
+            raise InvalidOperationError(f"app {app} already in input ModelState")
 
         _ids = cast(List[int], ids or [0])
 
