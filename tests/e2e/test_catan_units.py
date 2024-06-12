@@ -9,7 +9,6 @@ from catan.catan import (
     App,
     Binding,
     Catan,
-    CatanError,
     InconsistentStateError,
     Integration,
     ModelState,
@@ -96,7 +95,9 @@ def traefik_state():
                         "-name",
                         "*.yaml",
                         "-delete",
-                    ): ExecOutput()
+                    ): ExecOutput(),
+                    ("update-ca-certificates", "--fresh"): ExecOutput(),
+                    ("/usr/bin/traefik", "version"): ExecOutput(stdout="0.1"),
                 },
                 layers={
                     "foo": Layer(
@@ -216,8 +217,8 @@ def test_integrate(tempo, tempo_state, traefik, traefik_state):
         ModelState(
             {
                 tempo: {
-                    0: tempo_state.replace(leader=True),
-                    1: tempo_state.replace(leader=False),
+                    0: tempo_state.replace(leader=True),  # tempo/0
+                    1: tempo_state.replace(leader=False),  # tempo/1
                 },
                 traefik: {0: traefik_state.replace(leader=True)},
             }
@@ -305,14 +306,8 @@ def test_run_action(tempo, tempo_state, traefik, traefik_state):
     assert c._emitted_repr == ["traefik/1 :: show_proxied_endpoints_action"]
 
 
-def test_deploy(tempo, tempo_state, traefik, traefik_state):
-    ms = ModelState(
-        {
-            tempo: {
-                0: tempo_state.replace(leader=True),
-            },
-        }
-    )
+def test_deploy(traefik, traefik_state):
+    ms = ModelState()
     c = Catan(ms)
 
     ms_trfk = c.deploy(traefik, ids=(6, 3), state_template=traefik_state)
@@ -602,3 +597,57 @@ def test_imatrix_fill(tempo, tempo_state, traefik, traefik_state):
         ms_final.unit_states[tempo][1].get_relations("tracing")[0].local_app_data
     )
     assert tempo0_tracing_app_data == tempo1_tracing_app_data
+
+
+def test_pebble_ready_all(tempo, tempo_state, traefik, traefik_state):
+    ms = ModelState(
+        {
+            tempo: {
+                0: tempo_state.replace(leader=True).with_can_connect("tempo", False),
+                1: tempo_state.replace(leader=False).with_can_connect("tempo", False),
+            },
+            traefik: {
+                0: traefik_state.replace(leader=True).with_can_connect("traefik", False)
+            },
+        }
+    )
+    c = Catan(ms)
+    ms_pebble_ready = c.pebble_ready()
+
+    assert c._queue_repr == [
+        "tempo/0 :: tempo_pebble_ready",
+        "tempo/1 :: tempo_pebble_ready",
+        "traefik/0 :: traefik_pebble_ready",
+    ]
+
+    # check we've connected all
+    for states in ms_pebble_ready.unit_states.values():
+        for state in states.values():
+            for container in state.containers:
+                assert container.can_connect
+
+
+def test_pebble_ready_one(tempo, tempo_state, traefik, traefik_state):
+    ms = ModelState(
+        {
+            tempo: {
+                0: tempo_state.replace(leader=True).with_can_connect("tempo", False),
+                1: tempo_state.replace(leader=False).with_can_connect("tempo", False),
+            },
+            traefik: {
+                0: traefik_state.replace(leader=True).with_can_connect("traefik", False)
+            },
+        }
+    )
+    c = Catan(ms)
+    ms_pebble_ready = c.pebble_ready(tempo, 1, "tempo")
+
+    assert c._queue_repr == [
+        "tempo/1 :: tempo_pebble_ready",
+    ]
+
+    # check we've connected only tempo/1:tempo
+    unit_states = ms_pebble_ready.unit_states
+    assert not unit_states[tempo][0].get_container("tempo").can_connect
+    assert unit_states[tempo][1].get_container("tempo").can_connect
+    assert not unit_states[traefik][0].get_container("traefik").can_connect

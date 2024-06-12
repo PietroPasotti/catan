@@ -26,7 +26,7 @@ from typing import (
 
 import scenario  # pyright: ignore[reportMissingImports]
 from ops import CharmBase
-from scenario import consistency_checker
+from scenario import consistency_checker  # pyright: ignore[reportMissingImports]
 from scenario.state import _CharmSpec, _DCBase  # pyright: ignore[reportMissingImports]
 
 logger = logging.getLogger("catan")
@@ -121,6 +121,10 @@ class App(_DCBase):
 
         # unimport charm else the next 'import' will pick it up again
         sys.modules.pop("charm")
+        for sr in sources_roots:
+            if sr in sys.path:
+                sys.path.remove(sr)
+
         return App(spec, alias=name or spec.meta["name"])
 
     @staticmethod
@@ -132,7 +136,8 @@ class App(_DCBase):
         branch: Optional[str] = None,
     ):
         """Load app from a git repo."""
-        url = f"git@github.com:{org}/{repo_name}"
+        # url = f"git@github.com:{org}/{repo_name}"
+        url = f"http://github.com/{org}/{repo_name}"
 
         destination = tempfile.TemporaryDirectory()
         _branch = f" --branch {branch}" if branch else ""
@@ -274,6 +279,10 @@ class ModelState(_DCBase):
         no_units = sum(map(len, self.unit_states.values()))
         return f"<ModelState ({len(self.unit_states)} apps, {no_units} units)>"
 
+    def get_unit_state(self, app: App, unit: int):
+        """Get a specific unit state."""
+        return self.unit_states[app][unit]
+
 
 _qitem_counter = count()
 
@@ -317,9 +326,11 @@ class Catan:
     Like scenario, but for multiple charms.
     """
 
+    _emit_pebble_ready_after_setup_phase = False
+    """Catan-wide default to toggle automatically firing pebble-ready at some point during the startup sequence."""
+
     def __init__(self, model_state: Optional[ModelState] = None):
         self._model_state = model_state or ModelState()
-
         # used to keep track of states we remove from self._model_state (e.g. with remove_unit)
         # but we still need in order to be able to scenario the charm.
         self._dead_unit_states: Dict[App, Dict[int, scenario.State]] = defaultdict(dict)
@@ -785,26 +796,82 @@ class Catan:
         #  app:endpoint pairs that support them. Split by provider and requirer
 
         # mapping from apps to interfaces to endpoints
-        providers = {}
-        requirers = {}
+        providers = defaultdict(list)
+        requirers = defaultdict(list)
 
         pool = apps or list(self._model_state.unit_states)
 
         for _app in pool:
             # mapping from interfaces to app, endpoint pairs
-            providers_from_app = defaultdict(list)
             for endpoint, ep_meta in _app.charm.meta.get("provides", {}).items():
-                providers_from_app[ep_meta["interface"]].append((_app, endpoint))
-            providers.update(providers_from_app)
+                providers[ep_meta["interface"]].append((_app, endpoint))
 
-            requirers_from_app = defaultdict(list)
             for endpoint, ep_meta in _app.charm.meta.get("requires", {}).items():
-                requirers_from_app[ep_meta["interface"]].append((_app, endpoint))
-            requirers.update(requirers_from_app)
+                requirers[ep_meta["interface"]].append((_app, endpoint))
 
         # interfaces that have both a requirer and a provider in the pool of apps under consideration
         # sorting is to make our lives easier in testing
         return providers, requirers
+
+    def pebble_ready(
+        self,
+        app: Optional[App] = None,
+        unit: Optional[int] = None,
+        container_name: Optional[str] = None,
+    ) -> ModelState:
+        """Toggle container readiness in the model, an app or a specific unit.
+
+        Defaults to all containers. Pass a container_name to target a specific container.
+        """
+        if container_name and not unit:
+            raise RuntimeError("You need to provide `app` and `unit` as well.")
+        if unit and not app:
+            raise RuntimeError("You need to provide `app` as well.")
+
+        def _connect(state: scenario.State, _app: App, _unit: int) -> scenario.State:
+            # set container connectivity to True in this state (for a specific container
+            # name, or all of them) and trigger the appropriate events
+
+            if container_name:
+                container = state.get_container(container_name)
+                if container.can_connect:
+                    logger.warning(f"container {container_name} are ready already")
+                self._queue(
+                    self._model_state, container.pebble_ready_event, _app, _unit
+                )
+                return state.with_can_connect(container_name, True)
+            else:
+                if already_on := list(
+                    filter(lambda x: x.can_connect, state.containers)
+                ):
+                    logger.warning(
+                        f"containers {[c.name for c in already_on]} are ready already"
+                    )
+                for c in state.containers:
+                    self._queue(self._model_state, c.pebble_ready_event, _app, _unit)
+                containers = [c.replace(can_connect=True) for c in state.containers]
+                return state.replace(containers=containers)
+
+        new_unit_states = {}
+        for _app, unit_states in self._model_state.unit_states.items():
+            _new_unit_states_for_app = unit_states.copy()
+            if not app or _app.name == app.name:
+                if unit:
+                    # only replace for the one unit
+                    _new_unit_states_for_app[unit] = _connect(
+                        _new_unit_states_for_app[unit], _app, unit
+                    )
+                else:
+                    # replace all of them
+                    _new_unit_states_for_app = {
+                        _unit: _connect(_new_unit_states_for_app[_unit], _app, _unit)
+                        for _unit in unit_states
+                    }
+            new_unit_states[_app] = _new_unit_states_for_app
+
+        ms = self._model_state.replace(unit_states=new_unit_states)
+        self._model_state = ms
+        return ms
 
     def integrate(
         self,
@@ -819,12 +886,12 @@ class Catan:
         found = None
         providers, requirers = self._get_interfaces((app1, app2))
         for shared_interface in set(providers).intersection(set(requirers)):
-            for _, prov_ep in providers[shared_interface]:
-                for _, req_ep in requirers[shared_interface]:
-                    if prov_ep == endpoint1 and req_ep == endpoint2:
-                        found = shared_interface
-                        break
-                    elif prov_ep == endpoint2 and req_ep == endpoint1:
+            for prov_app, prov_ep in providers[shared_interface]:
+                for req_app, req_ep in requirers[shared_interface]:
+                    if {prov_ep, req_ep} == {endpoint1, endpoint2} and {
+                        prov_app,
+                        req_app,
+                    } == {app1, app2}:
                         found = shared_interface
                         break
 
@@ -899,6 +966,10 @@ class Catan:
         self._model_state = ms_out
         return ms_out
 
+    def get_app(self, name: str) -> App:
+        """Get an app by name."""
+        return [a for a in self._model_state.unit_states if a.name == name][0]
+
     def get_integration(self, app1: App, endpoint: str, app2: App) -> Integration:
         """Get an integration."""
         to_remove = None
@@ -930,7 +1001,7 @@ class Catan:
         self,
         action: Union[str, scenario.Action],
         app: App,
-        unit: int,
+        unit: Optional[int] = None,
     ):
         """Run an action on all units or a specific one."""
         if not isinstance(action, scenario.Action):
@@ -982,6 +1053,7 @@ class Catan:
         app: App,
         unit: int,
         state: scenario.State,
+        emit_pebble_ready: Optional[bool] = None,
     ):
         """Adds a unit to this application."""
         model_state = self._model_state
@@ -1001,6 +1073,10 @@ class Catan:
 
         self._model_state = new_model_state
         self.queue_setup_sequence(app, unit)
+
+        if self._should_emit_pebble_ready_on_setup(emit_pebble_ready):
+            self.pebble_ready(app, unit)
+
         return new_model_state
 
     def imatrix_clear(self, *app: App) -> List[Integration]:
@@ -1165,6 +1241,7 @@ class Catan:
         ids: Optional[Sequence[int]] = None,
         state_template: Optional[scenario.State] = None,
         leader_id: Optional[int] = None,
+        emit_pebble_ready: bool = False,
     ):
         """Deploy an app."""
         model_state = self._model_state
@@ -1191,6 +1268,9 @@ class Catan:
         self._model_state = new_model_state
         self.queue_setup_sequence(app)
 
+        if self._should_emit_pebble_ready_on_setup(emit_pebble_ready):
+            self.pebble_ready(app)
+
         return new_model_state
 
     @property
@@ -1206,7 +1286,7 @@ class Catan:
             )
 
             out.append(
-                f"{cast(App,e.app).name}/{e.unit_id} :: {e.event.path}{remote_unit}"
+                f"{cast(App, e.app).name}/{e.unit_id} :: {e.event.path}{remote_unit}"
             )
         return out
 
@@ -1252,3 +1332,8 @@ class Catan:
 
         else:
             random.shuffle(self._event_queue)
+
+    def _should_emit_pebble_ready_on_setup(self, user_override: Optional[bool] = None):
+        if user_override is None:
+            return self._emit_pebble_ready_after_setup_phase
+        return user_override
