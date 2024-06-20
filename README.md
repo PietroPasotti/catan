@@ -7,6 +7,7 @@ Let's break it down:
 - It's testing framework-agnostic.
 - It's built on top of [`ops-scenario`](https://github.com/canonical/ops-scenario).
 - It's mainly meant for testing the integration between different charms as they communicate over relation data.
+- It's about integration testing the charms (and the way they interact with the juju model): NOT the workloads and NOT the substrate they are running on.
 
 Catan is a **juju model-level simulation tool**.
 
