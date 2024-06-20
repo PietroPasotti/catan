@@ -79,8 +79,9 @@ def test_integrate():
         patches=[
             patch("charm.KubernetesServicePatch")
         ])
-    traefik = App.from_path(
-        "/path/to/traefik-k8s-operator/",
+    traefik = App.from_git(
+        "canonical",
+        "traefik-k8s-operator",
         patches=[
             patch("charm.KubernetesServicePatch")
         ])
@@ -100,6 +101,7 @@ def test_integrate():
     # output is the model state in its final form
     ms: ModelState = c.settle()
     
+    # we can inspect what has been emitted by catan
     assert c._emitted_repr == [
         # this is the initial event sequence, programmed by juju
         'tempo/0 :: tracing_relation_created',
@@ -273,6 +275,22 @@ Typically, on `relation-changed` events, a charm can write data to their side of
 So usually you'll see a back-and-forth of `relation-changed` events until the charms settle and stop reacting to one another's writes, depending on the protocol.
 
 
+## Running actions
+Running actions is done via the `run_action` API. 
+
+```python
+from catan import Catan, App
+from scenario import Action
+
+c = Catan()
+app1 = App.from_git("canonical", "tempo-k8s")
+c.deploy(app1)
+
+c.run_action("do-something", app1)  # on all units
+c.run_action("do-something", app1, 0)  # on app1/0
+c.run_action(Action("do-something", params={"foo": "bar"}), app1, 0)  # with parameters
+```
+
 ## Randomization
 After you've populated the event queue, you can call `Catan.shuffle()` to randomize it in a way that still makes juju-sense. For example, a `start` event should not precede an `install` event.
 `Catan.shuffle()` ensures that the event sequences can interleave with other sequences, while their internal relative ordering remains intact.
@@ -288,4 +306,4 @@ with c.fixed_sequence():
   c.queue("stop", app, 0)
 ```
 
-This will make sure that, if you do `c.shuffle()`, the stop event will always fire after update-status does.
+This will make sure that, if you do `c.shuffle()`, the relative position of `stop` relative to `update-status` will remain unchanged in the queue.

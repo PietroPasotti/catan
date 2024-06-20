@@ -1179,6 +1179,14 @@ class Catan:
         """Run an action on all units or a specific one."""
         if not isinstance(action, scenario.Action):
             action = scenario.Action(action)
+        if app not in self.model_state:
+            raise InvalidOperationError(
+                f"app {app} not in model state: cannot queue action."
+            )
+        if unit is not None and unit not in self.model_state[app]:
+            raise InvalidOperationError(
+                f"app {app}/{unit} not in model state: cannot queue action."
+            )
 
         self._queue(self._model_state, cast(scenario.Action, action).event, app, unit)
 
