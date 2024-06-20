@@ -3,7 +3,7 @@ from unittest.mock import patch
 
 import pytest
 from ops.pebble import Layer
-from scenario import Container, Event, ExecOutput, Relation, State
+from scenario import Container, Event, ExecOutput, PeerRelation, Relation, State
 
 from catan.catan import (
     App,
@@ -30,6 +30,7 @@ def tempo():
 def tempo_state():
     return State(
         leader=True,
+        relations=[],
         containers=[
             Container(
                 name="tempo",
@@ -82,6 +83,7 @@ def traefik_state():
             # since we're passing a config, we have to provide all defaulted values
             "routing_mode": "path",
         },
+        relations=[PeerRelation("peers")],
         containers=[
             # unless the traefik service reports active, the
             # charm won't publish the ingress url.
@@ -303,7 +305,11 @@ def test_run_action(tempo, tempo_state, traefik, traefik_state):
     c.run_action("show-proxied-endpoints", traefik, 1)
 
     c.settle()
-    assert c._emitted_repr == ["traefik/1 :: show_proxied_endpoints_action"]
+    assert c._emitted_repr == [
+        "traefik/1 :: show_proxied_endpoints_action",
+        "traefik/3 :: peers_relation_changed",
+        "traefik/1 :: peers_relation_changed",
+    ]
 
 
 def test_deploy(traefik, traefik_state):
@@ -321,13 +327,15 @@ def test_deploy(traefik, traefik_state):
 
     assert c._emitted_repr == [
         "traefik/6 :: install",
-        "traefik/6 :: leader_elected",
-        "traefik/6 :: config_changed",
-        "traefik/6 :: start",
         "traefik/3 :: install",
+        "traefik/6 :: leader_elected",
         "traefik/3 :: leader_settings_changed",
+        "traefik/6 :: config_changed",
         "traefik/3 :: config_changed",
+        "traefik/6 :: start",
         "traefik/3 :: start",
+        "traefik/3 :: peers_relation_changed",
+        "traefik/6 :: peers_relation_changed",
     ]
 
 
@@ -354,14 +362,80 @@ def test_add_unit(tempo, tempo_state, traefik, traefik_state):
 
     assert c._emitted_repr == [
         "traefik/1 :: install",
-        "traefik/1 :: leader_elected",
-        "traefik/1 :: config_changed",
-        "traefik/1 :: start",
         "traefik/3 :: install",
+        "traefik/1 :: leader_elected",
         "traefik/3 :: leader_settings_changed",
+        "traefik/1 :: config_changed",
         "traefik/3 :: config_changed",
+        "traefik/1 :: start",
+        "traefik/3 :: start",
+        "traefik/3 :: peers_relation_changed",
+        "traefik/1 :: peers_relation_changed",
+        "traefik/42 :: install",
+        "traefik/1 :: leader_elected",
+        "traefik/3 :: leader_settings_changed",
+        "traefik/42 :: leader_settings_changed",
+        "traefik/42 :: config_changed",
+        "traefik/42 :: start",
+        "traefik/1 :: peers_relation_changed",
+        "traefik/3 :: peers_relation_changed",
+        "traefik/42 :: peers_relation_changed",
+    ]
+
+
+def test_add_unit_create_peers(tempo, tempo_state, traefik, traefik_state):
+    ms = ModelState(
+        {
+            tempo: {
+                0: tempo_state.replace(leader=True),
+            },
+        }
+    )
+    c = Catan(ms)
+    traefik_state_no_peers = traefik_state.replace(relations=[])
+    c.deploy(traefik, ids=(1, 3), state_template=traefik_state_no_peers)
+    c.settle()
+
+    new_traefik_unit_state = traefik_state_no_peers.replace(leader=False)
+
+    ms_traefik_scaled = c.add_unit(traefik, 42, state=new_traefik_unit_state)
+
+    assert set(ms_traefik_scaled.unit_states[traefik]) == {1, 3, 42}
+    assert (
+        ms_traefik_scaled.unit_states[traefik][42].replace(relations=[])
+        == new_traefik_unit_state
+    )
+    assert len(ms_traefik_scaled.unit_states[traefik][42].get_relations("peers")) == 1
+    c.settle()
+
+    assert c._emitted_repr == [
+        "traefik/1 :: install",
+        "traefik/3 :: install",
+        "traefik/1 :: peers_relation_created",
+        "traefik/3 :: peers_relation_created",
+        "traefik/3 :: peers_relation_joined(traefik/1)",
+        "traefik/1 :: peers_relation_joined(traefik/3)",
+        "traefik/1 :: peers_relation_changed",
+        "traefik/3 :: peers_relation_changed",
+        "traefik/1 :: leader_elected",
+        "traefik/3 :: leader_settings_changed",
+        "traefik/1 :: config_changed",
+        "traefik/3 :: config_changed",
+        "traefik/1 :: start",
         "traefik/3 :: start",
         "traefik/42 :: install",
+        "traefik/1 :: peers_relation_created",
+        "traefik/3 :: peers_relation_created",
+        "traefik/42 :: peers_relation_created",
+        "traefik/1 :: peers_relation_joined(traefik/42)",
+        "traefik/42 :: peers_relation_joined(traefik/1)",
+        "traefik/3 :: peers_relation_joined(traefik/42)",
+        "traefik/42 :: peers_relation_joined(traefik/3)",
+        "traefik/1 :: peers_relation_changed",
+        "traefik/3 :: peers_relation_changed",
+        "traefik/42 :: peers_relation_changed",
+        "traefik/1 :: leader_elected",
+        "traefik/3 :: leader_settings_changed",
         "traefik/42 :: leader_settings_changed",
         "traefik/42 :: config_changed",
         "traefik/42 :: start",
@@ -480,11 +554,13 @@ def test_shuffle(tempo, tempo_state, traefik, traefik_state):
         "traefik/1 :: install",
         "traefik/3 :: install",
         "traefik/1 :: leader_elected",
-        "traefik/1 :: config_changed",
         "traefik/3 :: leader_settings_changed",
-        "traefik/1 :: start",
+        "traefik/1 :: config_changed",
         "traefik/3 :: config_changed",
+        "traefik/1 :: start",
         "traefik/3 :: start",
+        "traefik/3 :: peers_relation_changed",
+        "traefik/1 :: peers_relation_changed",
     ]
 
 
@@ -500,14 +576,16 @@ def test_shuffle_nonsequential(tempo, tempo_state, traefik, traefik_state):
 
     # anything goes
     assert c._emitted_repr == [
+        "traefik/1 :: start",
         "traefik/3 :: config_changed",
         "traefik/3 :: leader_settings_changed",
-        "traefik/1 :: start",
-        "traefik/1 :: leader_elected",
-        "traefik/3 :: start",
         "traefik/3 :: install",
+        "traefik/3 :: start",
         "traefik/1 :: config_changed",
+        "traefik/1 :: leader_elected",
         "traefik/1 :: install",
+        "traefik/3 :: peers_relation_changed",
+        "traefik/1 :: peers_relation_changed",
     ]
 
 
@@ -527,6 +605,7 @@ def test_config(tempo, tempo_state, traefik, traefik_state):
     assert c._emitted_repr == [
         "traefik/0 :: config_changed",
         "traefik/2 :: config_changed",
+        "traefik/0 :: peers_relation_changed",
     ]
 
 
