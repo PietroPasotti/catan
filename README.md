@@ -42,16 +42,109 @@ While the primary data structure you play with in Scenario is the `State` (which
     - The unit IDs and `scenario.State`s of each individual unit of the app.
 - The list of `Integrations` present in the model.
 
+Usage:
+
+```python
+from scenario import State
+
+from catan import ModelState, App, Integration, Catan
+
+app1 = App(...)
+app2 = App(...)
+
+foo_bar_integration = Integration.from_endpoints(app1, "foo", app2, "bar")
+ms = ModelState(
+    unit_states={
+        app1: {0: State()},
+        app2: {0: State()},
+    },
+    integrations=[
+        foo_bar_integration
+    ]
+)
+
+c = Catan(ms)
+# do things with catan, such as
+ms_out: ModelState = c.disintegrate(foo_bar_integration)
+
+# the integration is gone from the model state:
+assert not ms_out.integrations
+
+# and catan has queued relation-departed, relation-broken events on all affected units.
+assert c._event_queue
+
+# execute all queued events
+c.settle()
+```
+
 ### App
 
 The `App` data structure encapsulates:
 - App name, such as "nginx"
 - Charm source and metadata (yes, a physical charm's source code)
 
+Usage:
+
+```python
+from ops import CharmBase
+from scenario import State
+from catan import ModelState, App, Catan
+
+
+class MyCharm(CharmBase):
+    ...
+
+
+app1 = App.from_git("canonical", "traefik-k8s")
+app2 = App.from_type(MyCharm, "mycharm")
+app3 = App.from_path("/path/to/local/charm/repo", "local-charm")
+
+# use it to declaratively set up a model...
+ms = ModelState(
+    unit_states={
+        app1: {0: State()},
+        app2: {0: State()},
+        app3: {0: State()},
+    }
+)
+
+# ... or use it to imperatively do the same
+c = Catan()
+c.deploy(app1)
+c.deploy(app2)
+c.deploy(app3)
+```
+
+
 ### Integration
 
 The `Integration` data structure encapsulates:
 - Two Apps and the endpoints by which they are integrated.
+
+```python
+from scenario import State
+from catan import ModelState, App, Integration, Catan
+
+app1 = App(...)
+app2 = App(...)
+
+# use it to declaratively set up a model...
+ms = ModelState(
+    unit_states={
+        app1: {0: State()},
+        app2: {0: State()},
+    },
+    integrations=[
+        Integration.from_endpoints(app1, "foo", app2, "bar")
+    ]
+)
+
+# ...or use it to imperatively do the same
+c = Catan()
+c.deploy(app1)
+c.deploy(app2)
+c.integrate(app1, "foo", app2, "bar")
+```
 
 
 # Using Catan

@@ -319,6 +319,11 @@ class Integration(_DCBase):
     binding1: Binding
     binding2: Binding
 
+    @staticmethod
+    def from_endpoints(app1: App, endpoint1: str, app2: App, endpoint2: str):
+        """Construct an Integration object from its endpoints."""
+        return Integration(Binding(app1, endpoint1), Binding(app2, endpoint2))
+
     @property
     def apps(self) -> Tuple[App, App]:
         """Apps partaking in this integration."""
@@ -782,10 +787,12 @@ class Catan:
 
             if (
                 # unit data changed
-                remote_rel_from.remote_units_data != new_remote_units_data
+                remote_rel_from.remote_units_data
+                != new_remote_units_data
             ) or (
                 # app data changed
-                remote_rel_from.remote_app_data != relation_from.local_app_data
+                remote_rel_from.remote_app_data
+                != relation_from.local_app_data
             ):
                 new_remote_rel_from = remote_rel_from.replace(
                     remote_units_data=new_remote_units_data,
