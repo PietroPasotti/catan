@@ -1,7 +1,9 @@
 import random
 from unittest.mock import patch
 
+import ops
 import pytest
+from ops import CharmBase, Framework
 from ops.pebble import Layer
 from scenario import Container, Event, ExecOutput, PeerRelation, Relation, State
 
@@ -12,6 +14,7 @@ from catan.catan import (
     InconsistentStateError,
     Integration,
     ModelState,
+    RunState,
     _QueueItem,
 )
 
@@ -730,3 +733,64 @@ def test_pebble_ready_one(tempo, tempo_state, traefik, traefik_state):
     assert not unit_states[tempo][0].get_container("tempo").can_connect
     assert unit_states[tempo][1].get_container("tempo").can_connect
     assert not unit_states[traefik][0].get_container("traefik").can_connect
+
+
+@pytest.fixture
+def charmander():
+    class Charm(CharmBase):
+        META = {"name": "ander"}
+
+        def __init__(self, framework: Framework):
+            super().__init__(framework)
+            framework.observe(self.on.start, self._on_start)
+            framework.observe(self.on.install, self._on_install)
+
+        def _on_install(self, _):
+            self.unit.status = ops.BlockedStatus()
+
+        def _on_start(self, _):
+            self.unit.status = ops.ActiveStatus()
+
+    return App.from_type(Charm, meta=Charm.META)
+
+
+def test_until_runstate_nproc(charmander):
+    c = Catan()
+    c.deploy(charmander, ids=[0, 3, 45])
+
+    nproc = []
+
+    def stop(rs: RunState):
+        nproc.append(rs.n_processed_events)
+        return False
+
+    c.settle(until=stop)
+
+    assert nproc == list(range(1, 13))
+
+
+def test_until_runstate_last_seen(charmander):
+    c = Catan()
+
+    c.deploy(charmander, ids=[0, 3, 45])
+    c.queue("update-status")
+
+    status_history = set()
+    rs_seen = []
+
+    def stop(rs: RunState):
+        # stop as soon as tempo becomes active
+        rs_seen.append(rs)
+        current_status = rs.last_item.state_out.unit_status.name
+        if current_status == "active":
+            return True
+        status_history.add(current_status)
+        return False
+
+    c.settle(until=stop)
+
+    assert (
+        len(c._event_queue) == 5
+    )  # 2 start events for units 3 and 45, plus a round of update-status
+    assert rs_seen[-1].next_item.event.name == "start"
+    assert status_history == {"blocked"}

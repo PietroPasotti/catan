@@ -15,6 +15,7 @@ from itertools import chain, count
 from pathlib import Path
 from typing import (
     Any,
+    Callable,
     Dict,
     Iterable,
     List,
@@ -117,6 +118,22 @@ def _import_charm_module(charm_root: Path):
 
     module = import_module("charm")
     return module
+
+
+@dataclasses.dataclass(frozen=True)
+class RunState:
+    catan: "Catan"
+    model_state: "ModelState"
+
+    queue: List["_QueueItem"]
+    last_item: "_HistoryItem"  # not just queueitem: we might also need the unit state
+    next_item: Optional["_QueueItem"]
+    history: List["_HistoryItem"]
+
+    @property
+    def n_processed_events(self):
+        """Count the number of processed events."""
+        return len(self.history)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -492,16 +509,23 @@ class Catan:
         self._current_group = None
         logger.debug(f"exiting group sequence {self._fixed_sequence_counter}")
 
-    def _get_next_queue_item(self) -> Optional[_QueueItem]:
+    def _get_next_queue_item(self, _pop: bool = True) -> Optional[_QueueItem]:
         if self._event_queue:
-            return self._event_queue.pop(0)
+            if _pop:
+                return self._event_queue.pop(0)
+            else:
+                return self._event_queue[0]
 
     @property
     def emitted(self) -> List[_HistoryItem]:
         """Inspect all events that have been emitted so far by this Catan."""
         return self._emitted
 
-    def settle(self, steps: Optional[int] = None) -> ModelState:
+    def settle(
+        self,
+        steps: Optional[int] = None,
+        until: Optional[Callable[[RunState], bool]] = None,
+    ) -> ModelState:
         """Settle Catan."""
         model_state = self._initial_sync()
 
@@ -519,11 +543,23 @@ class Catan:
             unit_id = cast(int, item.unit_id)
 
             ms_out, unit_state_out = self._fire(model_state, item.event, app, unit_id)
-            self._emitted.append(_HistoryItem(item, unit_state_out))
+            history_item = _HistoryItem(item, unit_state_out)
+            self._emitted.append(history_item)
 
             ms_out_synced = self._model_reconcile(ms_out, app, unit_id)
             model_state = ms_out_synced
 
+            if until and until(
+                RunState(
+                    catan=self,
+                    model_state=model_state,
+                    queue=self._event_queue,
+                    last_item=history_item,
+                    next_item=self._get_next_queue_item(_pop=False),
+                    history=self._emitted,
+                )
+            ):
+                break
             if steps and i >= steps:
                 break
 
