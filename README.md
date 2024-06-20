@@ -8,6 +8,19 @@ Let's break it down:
 - It's built on top of [`ops-scenario`](https://github.com/canonical/ops-scenario).
 - It's mainly meant for testing the integration between different charms as they communicate over relation data.
 
+Catan is a **juju model-level simulation tool**.
+
+- It allows you to simulate a single juju model.
+- It doesn't simulate the workloads, the cloud substrate: only The Juju Model of things:
+  - What applications are there
+  - What units they have
+  - How the apps are integrated
+- It simulates certain dynamic aspects of the model lifecycle too:
+  - The admin runs an action
+  - The admin deploys a new app, or scales an existing one up/down
+  - The admin integrates/disintegrates two endpoints
+
+  
 ## Why not scenario?
 
 Scenario operates at the level of the single charm unit execution: **one charm instance, one juju event** at a time. In order to practically verify the interaction between two charms, one has to continually manually play the role of the 'remote' unit and mock the relation data it would present or reply with in a given interaction.
