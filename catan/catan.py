@@ -376,7 +376,7 @@ class _QueueItem:
     event: scenario.Event
     app: Optional[App]
     unit_id: Optional[Optional[int]]
-    group: Optional[int]
+    group: Optional[int] = None
     _index: int = dataclasses.field(default_factory=lambda: next(_qitem_counter))
 
     def __eq__(  # pyright: ignore[reportIncompatibleMethodOverride]
@@ -577,22 +577,14 @@ class Catan:
             logger.info(f"processing item {item} ({i}/{len(self._event_queue)})")
 
             # queue items are fully specified
-            app = cast(App, item.app)
-            unit_id = cast(int, item.unit_id)
-
-            ms_out, unit_state_out = self._fire(model_state, item.event, app, unit_id)
-            history_item = _HistoryItem(item, unit_state_out)
-            self._emitted.append(history_item)
-
-            ms_out_synced = self._model_reconcile(ms_out, app, unit_id)
-            model_state = ms_out_synced
+            model_state = self._step(item, model_state)
 
             if on_event and on_event(
                 RunState(
                     catan=self,
                     model_state=model_state,
                     queue=self._event_queue,
-                    last_item=history_item,
+                    last_item=self._emitted[-1],
                     next_item=self._get_next_queue_item(_pop=False),
                     history=self._emitted,
                 )
@@ -612,6 +604,44 @@ class Catan:
         log = "\t" + "\n\t".join(self._emitted_repr)
         logger.info(f"Emission log: \n {log}")
         return self._final_sync(model_state)
+
+    def _step(self, item: _QueueItem, model_state: Optional[ModelState] = None):
+        """Progress the simulation by executing a single step."""
+        model_state = model_state or self._model_state
+        app = cast(App, item.app)
+        unit_id = cast(int, item.unit_id)
+
+        ms_out, unit_state_out = self._fire(model_state, item.event, app, unit_id)
+        self._emitted.append(_HistoryItem(item, unit_state_out))
+
+        ms_out_synced = self._model_reconcile(ms_out, app, unit_id)
+        return ms_out_synced
+
+    def fire(
+        self,
+        event: Union[str, scenario.Event],
+        app: App,
+        unit_id: int,
+        update_model_state: bool = True,
+    ) -> scenario.State:
+        """Execute a single event and return the unit state.
+
+        `event`: The event to fire.
+        `app`: App on which to fire the event.
+        `unit_id`: ID of the unit on which to fire the event.
+        `update_model_state`: whether any changes to the unit state should be recorded in the model
+          state attached to this Catan.
+        """
+        item = _QueueItem(
+            app=app,
+            unit_id=unit_id,
+            event=event if isinstance(event, scenario.Event) else scenario.Event(event),
+        )
+
+        ms_out = self._step(item)
+        if update_model_state:
+            self._model_state = ms_out
+        return ms_out.unit_states[app][unit_id]
 
     @staticmethod
     def _run_scenario(
@@ -1266,7 +1296,7 @@ class Catan:
 
         self._queue(self._model_state, cast(scenario.Action, action).event, app, unit)
 
-    def queue_setup_sequence(self, app: App, unit: Optional[int] = None):
+    def _queue_setup_sequence(self, app: App, unit: Optional[int] = None):
         """Queues setup phase event sequence for this app/unit."""
 
         model_state = self._model_state
@@ -1302,36 +1332,122 @@ class Catan:
             self._queue(model_state, "config-changed", app, unit)
             self._queue(model_state, "start", app, unit)
 
-    def queue_teardown_sequence(self, app: App, unit: Optional[int] = None):
-        """Queues teardown phase event sequence for this app/unit."""
+    def _queue_teardown_sequence(self, app: App, unit_id: int):
+        """Queues teardown phase event sequence for this app/unit_id."""
         model_state = self._model_state
 
-        if unit is None:
+        if unit_id is None:
             for unit_id in model_state.unit_states[app]:
-                self.queue_teardown_sequence(app, unit_id)
+                self._queue_teardown_sequence(app, unit_id)
             return
 
         with self.fixed_sequence():
             # todo storage detached events
-            # todo relation broken events
-            self._queue(model_state, "stop", app, unit)
-            self._queue(model_state, "remove", app, unit)
+
+            for integration in model_state.integrations:
+                if integration.binding1.app is app:
+                    remote_app = integration.binding2.app
+                    our_relation, their_relation = integration.relations
+                elif integration.binding2.app is app:
+                    remote_app = integration.binding1.app
+                    their_relation, our_relation = integration.relations
+                else:
+                    continue
+
+                # let this unit_id know that all remotes are departing
+                for remote_unit_id in model_state.unit_states[remote_app]:
+                    self._queue(
+                        model_state,
+                        our_relation.departed_event(remote_unit_id=remote_unit_id),
+                        app,
+                        unit_id,
+                    )
+
+                # let all units of the remote app know that this unit_id is leaving
+                self._queue(
+                    model_state,
+                    their_relation.departed_event(remote_unit_id=unit_id),
+                    remote_app,
+                )
+
+            for peer_endpoint in app.charm.meta.get("peers", {}):
+                peer_relations = self.get_unit_state(
+                    app, unit_id, model_state=model_state
+                ).get_relations(peer_endpoint)
+                if not peer_relations:
+                    # this is weird enough to deserve a log
+                    logger.debug(
+                        f"skipped teardown of peer relation {peer_endpoint!r}: not in state"
+                    )
+                    continue
+
+                peer_relation = peer_relations[0]
+
+                # let all peers know that this unit is going
+                for peer_id in peer_relation.peers_data:
+                    peer_state = self.get_unit_state(
+                        app, peer_id, model_state=model_state
+                    )
+                    # the peer's State has its own PeerRelation object, which is going to have a
+                    # different relation ID from the one attached to this unit's state.
+                    peer_relation_peer = peer_state.get_relations(peer_endpoint)[0]
+                    self._queue(
+                        model_state,
+                        peer_relation_peer.departed_event(remote_unit_id=unit_id),
+                        app,
+                        peer_id,
+                    )
+                    # and let this unit know that the peer is leaving, too!
+                    self._queue(
+                        model_state,
+                        peer_relation.departed_event(remote_unit_id=peer_id),
+                        app,
+                        unit_id,
+                    )
+                self._queue(model_state, peer_relation.broken_event, app, unit_id)
+
+            self._queue(model_state, "stop", app, unit_id)
+
+            self._queue(model_state, "stop", app, unit_id)
+            self._queue(model_state, "remove", app, unit_id)
+
+    def get_unit_state(
+        self, app: App, unit_id: int, model_state: Optional[ModelState] = None
+    ):
+        """Fetch the state of a single unit from the model state."""
+        _model_state = model_state or self._model_state
+        try:
+            return model_state.unit_states[app][unit_id]
+        except KeyError:
+            return self._dead_unit_states[app][unit_id]
 
     def add_unit(
         self,
         app: App,
-        unit: int,
-        state: scenario.State,
+        unit_id: Optional[int] = None,
+        state: Optional[scenario.State] = None,
         emit_pebble_ready: Optional[bool] = None,
     ):
-        """Adds a unit to this application."""
+        """Adds a unit to this application.
+
+        Params:
+        `app`: App you intend to scale up.
+        `unit_id`: ID of the newly created unit.
+          If None, we'll take the current max unit ID for this app (or 0, if no units are found)
+          and add 1.
+        `state`: state of the new unit. Will default to the empty state if None.
+        `emit_pebble_ready`: Whether we should queue a pebble-ready event for all containers in
+          the state as part of the startup sequence.
+        """
         model_state = self._model_state
         new_states = model_state.unit_states.copy()
 
         peers = new_states[app]
-        if unit in peers:
+        unit_id = unit_id if unit_id is not None else max(peers or (0,)) + 1
+        state = state or scenario.State()
+        if unit_id in peers:
             raise InvalidOperationError(
-                f"{app.name}/{unit} exists already in the model state"
+                f"{app.name}/{unit_id} exists already in the model state"
             )
 
         if peers:
@@ -1341,7 +1457,7 @@ class Catan:
         else:
             if not state.leader:
                 logger.info(
-                    f"new unit {unit} is the first unit of {app}: setting leader=True"
+                    f"new unit {unit_id} is the first unit of {app}: setting leader=True"
                 )
                 state = state.replace(leader=True)
 
@@ -1358,24 +1474,24 @@ class Catan:
             if state.config != leader_config:
                 if self._auto_fix_diverged_config_on_deploy:
                     logger.debug(
-                        f"new config for {app}/{unit} fixed to match the leader's."
+                        f"new config for {app}/{unit_id} fixed to match the leader's."
                     )
                     state = state.replace(config=leader_config)
                 else:
                     raise InconsistentStateError(
-                        f"the config for {app}/{unit} should match "
+                        f"the config for {app}/{unit_id} should match "
                         f"that of the application leader."
                     )
 
-        peers[unit] = state
+        peers[unit_id] = state
         new_model_state = model_state.replace(unit_states=new_states)
 
         self._model_state = new_model_state
         # this also queues the peer relation events and adds any peer relations
-        self.queue_setup_sequence(app, unit)
+        self._queue_setup_sequence(app, unit_id)
 
         if self._should_emit_pebble_ready_on_setup(emit_pebble_ready):
-            self.pebble_ready(app, unit)
+            self.pebble_ready(app, unit_id)
 
         return new_model_state
 
@@ -1476,13 +1592,13 @@ class Catan:
         self._dead_unit_states[app] = all_unit_states
 
         new_model_state: ModelState = model_state.replace(unit_states=new_states)
-        # set this first so that queue_setup_sequence will use it
+        # set this first so that _queue_setup_sequence will use it
         self._model_state = new_model_state
 
         # remove all integrations where app is involved BEFORE nuking the app
         self.imatrix_clear(app)
 
-        # we could call queue_teardown_sequence(app), but depending on who's the leader that might
+        # we could call _queue_teardown_sequence(app), but depending on who's the leader that might
         # trigger a lot more events than we'd like. If we're destroying the app there's no point
         # in electing a new leader each time, so instead we nuke the leader last,
         # to prevent any bouncing.
@@ -1490,8 +1606,8 @@ class Catan:
         leader_id = [i for i, s in all_unit_states.items() if s.leader][0]
         follower_ids.remove(leader_id)
         for follower_id in follower_ids:
-            self.queue_teardown_sequence(app, follower_id)
-        self.queue_teardown_sequence(app, leader_id)
+            self._queue_teardown_sequence(app, follower_id)
+        self._queue_teardown_sequence(app, leader_id)
 
         return new_model_state
 
@@ -1571,9 +1687,9 @@ class Catan:
 
             self._queue(new_model_state, "leader-settings-changed", app, unit)
 
-        # set this first so that queue_setup_sequence will use it
+        # set this first so that _queue_setup_sequence will use it
         self._model_state = new_model_state
-        self.queue_teardown_sequence(app, unit)
+        self._queue_teardown_sequence(app, unit)
 
         return new_model_state
 
@@ -1600,6 +1716,10 @@ class Catan:
         for peer_endpoint, peer_meta in app.charm.meta.get("peers", {}).items():
             if peer_endpoint in bound_peer_endpoints:
                 # user created this manually already, let's skip it
+                logger.debug(
+                    f"skipping setup sequence for peer relation on {peer_endpoint}: "
+                    f"relation in state already."
+                )
                 continue
 
             peer = scenario.PeerRelation(
@@ -1610,12 +1730,10 @@ class Catan:
             )
             peers.append(peer)
             self.queue(peer.created_event, app, unit_id)
-            # notify each peer that this unit is joining
             # notify this unit that each peer is joining
             for peer_id in peer_ids:
-                self.queue(peer.joined_event(remote_unit_id=unit_id), app, peer_id)
                 self.queue(peer.joined_event(remote_unit_id=peer_id), app, unit_id)
-            self.queue(peer.changed_event, app)
+            self.queue(peer.changed_event, app, unit_id)
         return existing_relations + peers
 
     def deploy(
@@ -1675,10 +1793,10 @@ class Catan:
 
         new_states[app] = unit_states
         new_model_state = model_state.replace(unit_states=new_states)
-        # set this first so that queue_setup_sequence will use it
+        # set this first so that _queue_setup_sequence will use it
         self._model_state = new_model_state
         # this will also add any missing peer relations to the states
-        self.queue_setup_sequence(app)
+        self._queue_setup_sequence(app)
 
         if self._should_emit_pebble_ready_on_setup(emit_pebble_ready):
             self.pebble_ready(app)
