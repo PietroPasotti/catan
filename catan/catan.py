@@ -185,7 +185,9 @@ class App(_DCBase):
             t
             for t in module.__dict__.values()
             if isinstance(t, type)
-            and issubclass(t, CharmBase)
+            # issubclass will misbehave if the way we're importing CharmBase in the
+            # repo is not the same as the way we're importing it here.
+            and "CharmBase" in {sup.__name__ for sup in t.__mro__}
             and not t.__name__ == "CharmBase"
         ]
 
