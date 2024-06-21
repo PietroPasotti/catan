@@ -20,7 +20,6 @@ from typing import (
     Iterable,
     List,
     Optional,
-    Sequence,
     Tuple,
     Type,
     Union,
@@ -421,8 +420,17 @@ class Catan:
     Like scenario, but for multiple charms.
     """
 
+    #############################
+    # CATAN-WIDE CONFIG OPTIONS #
+    #############################
+    _auto_create_containers_on_deploy = True
+    """Automatically add containers missing from the state template on deploy/add_unit."""
+    _auto_fix_diverged_config_on_deploy = True
+    """Automatically fix any divergence in config when adding a new unit."""
+    _auto_create_peer_relations_on_deploy = True
+    """Automatically add peer relations missing from the state template on deploy/add_unit."""
     _emit_pebble_ready_after_setup_phase = False
-    """Catan-wide default to toggle automatically firing pebble-ready at some point during the startup sequence."""
+    """Toggle automatically firing pebble-ready at some point during the startup sequence."""
 
     def __init__(self, model_state: Optional[ModelState] = None):
         self._model_state = model_state or ModelState()
@@ -440,13 +448,33 @@ class Catan:
         """The model state attached to this Catan."""
         return self._model_state
 
+    @property
+    def emitted(self) -> List[_HistoryItem]:
+        """Inspect all events that have been emitted so far by this Catan."""
+        return self._emitted
+
+    @property
+    def event_queue(self) -> List[_QueueItem]:
+        """Inspect all events that have been queued on this Catan."""
+        return self._event_queue
+
     def queue(
         self,
         event: Union[scenario.Event, str],
         app: Optional[App] = None,
         unit_id: Optional[int] = None,
     ):
-        """Queue an event for emission on an app or a unit."""
+        """Queue an event for emission on an app or a unit.
+
+        This is rather low-level API, useful when you want to test a specific event that isn't
+        part of any sequence in particular.
+
+        Example usage:
+
+        >>> c = Catan()
+        >>> c.deploy(App.from_path("/path/to/my/charm/repo"), ids=[0, 1, 2])
+        >>> c.queue("update-status")
+        """
         self._queue(self._model_state, event, app, unit_id)
 
     def _queue(
@@ -521,17 +549,20 @@ class Catan:
             else:
                 return self._event_queue[0]
 
-    @property
-    def emitted(self) -> List[_HistoryItem]:
-        """Inspect all events that have been emitted so far by this Catan."""
-        return self._emitted
-
     def settle(
         self,
         steps: Optional[int] = None,
-        until: Optional[Callable[[RunState], bool]] = None,
+        on_event: Optional[Callable[[RunState], bool]] = None,
     ) -> ModelState:
-        """Settle Catan."""
+        """Settle Catan.
+
+        Params:
+        ``steps``: execute at most this number of events from the queue and then return
+        ``on_event``: hook that will be called back after each event emission, giving the caller the
+            possibility to inspect the current state, the queue, and potentially even mutate the
+            queue itself.
+        """
+
         model_state = self._initial_sync()
 
         i = 0
@@ -554,7 +585,7 @@ class Catan:
             ms_out_synced = self._model_reconcile(ms_out, app, unit_id)
             model_state = ms_out_synced
 
-            if until and until(
+            if on_event and on_event(
                 RunState(
                     catan=self,
                     model_state=model_state,
@@ -1222,11 +1253,11 @@ class Catan:
         """Run an action on all units or a specific one."""
         if not isinstance(action, scenario.Action):
             action = scenario.Action(action)
-        if app not in self.model_state:
+        if app not in self.model_state.unit_states:
             raise InvalidOperationError(
                 f"app {app} not in model state: cannot queue action."
             )
-        if unit is not None and unit not in self.model_state[app]:
+        if unit is not None and unit not in self.model_state.unit_states[app]:
             raise InvalidOperationError(
                 f"app {app}/{unit} not in model state: cannot queue action."
             )
@@ -1239,11 +1270,6 @@ class Catan:
         model_state = self._model_state
 
         app_unit_states = model_state.unit_states[app]
-        # if unit is None:
-        #     for unit_id in app_unit_states:
-        #         self.queue_setup_sequence(app, unit_id)
-        #     return
-
         peer_ids = list(app_unit_states)
 
         with self.fixed_sequence():
@@ -1254,13 +1280,14 @@ class Catan:
             #  something like Integrations for peers. Perhaps self._peer_relation_ids[app][endpoint] ?
             # now queue all peer-relation events and create the peer
             # relations if they don't exist already
-            for peer_id in peer_ids:
-                base_state = app_unit_states[peer_id]
-                other_units = [i for i in peer_ids if i != peer_id]
-                relations = self._add_peer_relations(
-                    app, peer_id, other_units, base_state.relations
-                )
-                app_unit_states[peer_id] = base_state.replace(relations=relations)
+            if self._auto_create_peer_relations_on_deploy:
+                for peer_id in peer_ids:
+                    base_state = app_unit_states[peer_id]
+                    other_units = [i for i in peer_ids if i != peer_id]
+                    relations = self._add_peer_relations(
+                        app, peer_id, other_units, base_state.relations
+                    )
+                    app_unit_states[peer_id] = base_state.replace(relations=relations)
 
             for _unit in app_unit_states:
                 is_leader = app_unit_states[_unit].leader
@@ -1299,20 +1326,50 @@ class Catan:
         model_state = self._model_state
         new_states = model_state.unit_states.copy()
 
-        if unit in new_states[app]:
+        peers = new_states[app]
+        if unit in peers:
             raise InvalidOperationError(
                 f"{app.name}/{unit} exists already in the model state"
             )
 
-        if state.leader:
-            # todo consider doing state.replace(leader=False) instead of raising
-            raise InvalidOperationError("new units cannot join as leaders.")
+        if peers:
+            if state.leader:
+                # todo consider doing state.replace(leader=False) instead of raising
+                raise InvalidOperationError("new units cannot join as leaders.")
+        else:
+            if not state.leader:
+                logger.info(
+                    f"new unit {unit} is the first unit of {app}: setting leader=True"
+                )
+                state = state.replace(leader=True)
 
-        new_states[app][unit] = state
+        # add any containers
+        if self._auto_create_containers_on_deploy:
+            state = self._add_containers(state, app)
+
+        # make sure the config is the same
+        if peers:
+            # only do this check if we have peers: if we're the first unit our config
+            # is the one that matters
+            leader_config = self._get_leader_state(app).config
+
+            if state.config != leader_config:
+                if self._auto_fix_diverged_config_on_deploy:
+                    logger.debug(
+                        f"new config for {app}/{unit} fixed to match the leader's."
+                    )
+                    state = state.replace(config=leader_config)
+                else:
+                    raise InconsistentStateError(
+                        f"the config for {app}/{unit} should match "
+                        f"that of the application leader."
+                    )
+
+        peers[unit] = state
         new_model_state = model_state.replace(unit_states=new_states)
 
         self._model_state = new_model_state
-        # also queues the peer relation events
+        # this also queues the peer relation events and adds any peer relations
         self.queue_setup_sequence(app, unit)
 
         if self._should_emit_pebble_ready_on_setup(emit_pebble_ready):
@@ -1373,11 +1430,16 @@ class Catan:
         """Update the app configuration."""
         model_state = self._model_state
         new_states = model_state.unit_states.copy()
+        leader_state = self._get_leader_state(app)
+        if not leader_state:
+            raise InvalidOperationError(f"{app} has no leader: cannot configure.")
+
+        config = leader_state.config
+        config.update(_config)
+
         new_unit_states = {}
         for _id, _unit_state in new_states[app].items():
-            new_unit_state = _unit_state.replace(
-                config={**_unit_state.config, **_config}
-            )
+            new_unit_state = _unit_state.replace(config=config)
 
             self._consistency_check(
                 consistency_checker.check_config_consistency(
@@ -1391,7 +1453,6 @@ class Catan:
             new_unit_states[_id] = new_unit_state
 
         new_states[app] = new_unit_states
-
         new_model_state = model_state.replace(unit_states=new_states)
 
         self._queue(new_model_state, "config-changed", app)
@@ -1432,8 +1493,52 @@ class Catan:
 
         return new_model_state
 
-    def remove_unit(self, app: App, unit: int):
-        """Remove an app."""
+    def scale(self, app: App, target: int) -> ModelState:
+        """Scale an app up or down, by setting its unit count to `n`.
+
+        If scaling up:
+         - Any newly created units will have IDs increasing from the highest one currently in
+           the model state.
+         - The state of the newly created units will, too, be copied from the one with the highest ID.
+        If scaling down:
+         - Units with the lowest ID will be removed first (to avoid a flurry of leader re-elections,
+           because if the leader is removed, the unit with the highest ID is elected by default).
+
+        Params:
+        `app`: app that you want to scale up or down.
+        `target`: target number of units this app should have.
+        """
+        unit_states = self.model_state.unit_states[app]
+        max_id = max(unit_states)
+        current_count = len(unit_states)
+
+        if target > current_count:
+            logger.info(f"scaling up {app} from {current_count} to {target}")
+            for i in range(target - current_count):
+                self.add_unit(app, max_id + i + 1, state=unit_states[max_id].copy())
+
+        elif target < current_count:
+            logger.info(f"scaling down {app} from {current_count} to {target}")
+            current_ms = self._model_state
+            for i in range(current_count - target):
+                min_id = min(current_ms.unit_states[app])
+                current_ms = self.remove_unit(app, min_id)
+
+        else:
+            raise InvalidOperationError(f"app {app} already has scale {target}.")
+
+        return self._model_state
+
+    def remove_unit(self, app: App, unit: int, new_leader_id: Optional[int] = None):
+        """Remove a unit.
+
+        Params:
+        `app`: app that you want to scale down.
+        `unit`: unit that you want to vanquish.
+        `new_leader_id`: ID of the unit that should be elected leader, if the unit you are
+          removing happens to be the leader one. Leave it blank, and it shall be the unit with
+          the smallest ID.
+        """
         model_state = self._model_state
         new_states = model_state.unit_states.copy()
 
@@ -1448,7 +1553,7 @@ class Catan:
         if unit_state.leader:
             # killing the leader!
             if new_states[app]:
-                new_leader_id = random.choice(list(new_states[app]))
+                new_leader_id = new_leader_id or min(list(new_states[app]))
                 logger.debug(
                     f"killing the leader. Electing {new_leader_id} instead. "
                     f"Long live {app}/{new_leader_id}!"
@@ -1514,20 +1619,41 @@ class Catan:
     def deploy(
         self,
         app: App,
-        # TODO: add --num-units options
-        ids: Optional[Sequence[int]] = None,
+        ids: Optional[Iterable[int]] = None,
         state_template: Optional[scenario.State] = None,
         leader_id: Optional[int] = None,
         emit_pebble_ready: bool = False,
-    ):
-        """Deploy an app."""
+    ) -> ModelState:
+        """Deploy an app.
+
+        `app`: The App to deploy
+        `ids`: IDs of the units that should be created. If left None, a single unit of the app
+          will be created, with ID 0.
+        `state_template`: Blueprint of the scenario.State that should be assigned to all newly
+          created units. If you need different states to be assigned to different units, you
+          should use `deploy()` to deploy the leader, and `add_unit()` to add any follower units
+          and assign to them the state you want.
+        `leader_id`: ID of the unit that should be leader, selected amongst the `ids` you provided.
+          Defaults to the first ID in the iterable you supplied.
+        `emit_pebble_ready`: emit all pebble-ready events as part of the setup sequence.
+
+
+        Example usage:
+        >>> c = Catan()
+        >>> c.deploy(
+        ...    App.from_path("/path/to/my/charm/repo"),
+        ...    ids=[0, 10, 24],  # create three units with id 0, 10 and 24
+        ...    state_template=scenario.State(config={'foo': 'bar'}),
+        ...    leader_id=10,  # unit 10 is leader
+        ...    )
+        """
         model_state = self._model_state
         new_states = model_state.unit_states.copy()
 
         if app in new_states:
             raise InvalidOperationError(f"app {app.name} already in input ModelState")
 
-        _ids = cast(List[int], ids or [0])
+        _ids: List[int] = list(ids) if ids else [0]
 
         if not leader_id:
             leader_id = _ids[0]
@@ -1539,12 +1665,17 @@ class Catan:
         unit_states = {}
 
         for _id in _ids:
+            # most charms will break if there's no container they should have
+            if self._auto_create_containers_on_deploy:
+                base_state = self._add_containers(base_state, app)
+
             unit_states[_id] = base_state.replace(leader=(leader_id == _id))
 
         new_states[app] = unit_states
         new_model_state = model_state.replace(unit_states=new_states)
         # set this first so that queue_setup_sequence will use it
         self._model_state = new_model_state
+        # this will also add any missing peer relations to the states
         self.queue_setup_sequence(app)
 
         if self._should_emit_pebble_ready_on_setup(emit_pebble_ready):
@@ -1624,3 +1755,32 @@ class Catan:
         if _raise and not result:
             raise CheckFailed(failures)
         return result
+
+    @staticmethod
+    def _add_containers(state: scenario.State, app: App):
+        existing_containers = set(c.name for c in state.containers)
+        required_containers = set(app.charm.meta.get("containers", ()))
+        missing_containers = required_containers.difference(existing_containers)
+        logger.debug(f"adding missing containers to {app}: {missing_containers}")
+
+        return state.replace(
+            containers=state.containers
+            + [
+                scenario.Container(container_name)
+                for container_name in missing_containers
+            ]
+        )
+
+    def _get_leader_state(self, app: App) -> Optional[scenario.State]:
+        leaders = [
+            state
+            for state in self._model_state.unit_states[app].values()
+            if state.leader
+        ]
+
+        if not leaders:
+            return None
+
+        if len(leaders) > 1:
+            raise InconsistentStateError(f"{app} has too many leaders")
+        return leaders[0]

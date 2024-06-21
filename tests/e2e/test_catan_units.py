@@ -415,11 +415,11 @@ def test_add_unit_create_peers(tempo, tempo_state, traefik, traefik_state):
         "traefik/1 :: install",
         "traefik/3 :: install",
         "traefik/1 :: peers_relation_created",
-        "traefik/3 :: peers_relation_created",
         "traefik/3 :: peers_relation_joined(traefik/1)",
         "traefik/1 :: peers_relation_joined(traefik/3)",
         "traefik/1 :: peers_relation_changed",
         "traefik/3 :: peers_relation_changed",
+        "traefik/3 :: peers_relation_created",
         "traefik/1 :: leader_elected",
         "traefik/3 :: leader_settings_changed",
         "traefik/1 :: config_changed",
@@ -427,8 +427,6 @@ def test_add_unit_create_peers(tempo, tempo_state, traefik, traefik_state):
         "traefik/1 :: start",
         "traefik/3 :: start",
         "traefik/42 :: install",
-        "traefik/1 :: peers_relation_created",
-        "traefik/3 :: peers_relation_created",
         "traefik/42 :: peers_relation_created",
         "traefik/1 :: peers_relation_joined(traefik/42)",
         "traefik/42 :: peers_relation_joined(traefik/1)",
@@ -754,6 +752,25 @@ def charmander():
     return App.from_type(Charm, meta=Charm.META)
 
 
+def test_scale(charmander):
+    c = Catan()
+
+    def assert_scale(s):
+        assert len(c.model_state.unit_states[charmander]) == s
+
+    c.deploy(charmander, ids=[1, 2])
+    assert_scale(2)
+
+    c.scale(charmander, 10)
+    assert_scale(10)
+
+    c.scale(charmander, 3)
+    assert_scale(3)
+
+    c.scale(charmander, 0)
+    assert_scale(0)
+
+
 def test_until_runstate_nproc(charmander):
     c = Catan()
     c.deploy(charmander, ids=[0, 3, 45])
@@ -764,7 +781,7 @@ def test_until_runstate_nproc(charmander):
         nproc.append(rs.n_processed_events)
         return False
 
-    c.settle(until=stop)
+    c.settle(on_event=stop)
 
     assert nproc == list(range(1, 13))
 
@@ -778,8 +795,8 @@ def test_until_runstate_last_seen(charmander):
     status_history = set()
     rs_seen = []
 
-    def stop(rs: RunState):
-        # stop as soon as tempo becomes active
+    def on_event(rs: RunState):
+        # on_event as soon as tempo becomes active
         rs_seen.append(rs)
         current_status = rs.last_item.state_out.unit_status.name
         if current_status == "active":
@@ -787,10 +804,92 @@ def test_until_runstate_last_seen(charmander):
         status_history.add(current_status)
         return False
 
-    c.settle(until=stop)
+    c.settle(on_event=on_event)
 
     assert (
         len(c._event_queue) == 5
     )  # 2 start events for units 3 and 45, plus a round of update-status
     assert rs_seen[-1].next_item.event.name == "start"
     assert status_history == {"blocked"}
+
+
+@pytest.fixture
+def underspecced():
+    class Charm(CharmBase):
+        META = {
+            "name": "ander",
+            "peers": {"foo": {"interface": "bar"}},
+            "containers": {"rob": {}},
+        }
+
+        def __init__(self, framework: Framework):
+            super().__init__(framework)
+            framework.observe(self.on.start, self._on_start)
+            framework.observe(self.on.install, self._on_install)
+
+        def _on_install(self, _):
+            self.unit.status = ops.BlockedStatus()
+
+        def _on_start(self, _):
+            self.unit.status = ops.ActiveStatus()
+
+    return App.from_type(Charm, meta=Charm.META)
+
+
+def test_peer_autocreation(underspecced):
+    c = Catan()
+
+    # if we omit peer relations from the state
+    uids = [0, 3, 45]
+    ms_out = c.deploy(underspecced, ids=uids, state_template=State())
+
+    for uid in uids:
+        state = ms_out.unit_states[underspecced][uid]
+        assert len(state.relations) == 1
+        peer_rel = state.relations[0]
+        assert peer_rel.endpoint == "foo"
+        assert peer_rel.peers_data == {
+            other_uid: {} for other_uid in uids if other_uid != uid
+        }
+
+
+def test_peer_autocreation_off(underspecced):
+    c = Catan()
+    c._auto_create_peer_relations_on_deploy = False
+
+    # if we omit peer relations from the state
+    uids = [0, 3, 45]
+    ms_out = c.deploy(underspecced, ids=uids, state_template=State())
+
+    for uid in uids:
+        state = ms_out.unit_states[underspecced][uid]
+        assert len(state.relations) == 0
+
+
+def test_container_autocreation(underspecced):
+    c = Catan()
+
+    # if we omit containers from the state template
+    uids = [0, 3, 45]
+    ms_out = c.deploy(underspecced, ids=uids, state_template=State())
+
+    # catan has created them for us
+    for uid in uids:
+        state = ms_out.unit_states[underspecced][uid]
+        assert len(state.containers) == 1
+        container = state.containers[0]
+        assert container == Container("rob")
+
+
+def test_container_autocreation_off(underspecced):
+    c = Catan()
+    c._auto_create_containers_on_deploy = False
+
+    # if we omit containers from the state template
+    uids = [0, 3, 45]
+    ms_out = c.deploy(underspecced, ids=uids, state_template=State())
+
+    # catan has created them for us
+    for uid in uids:
+        state = ms_out.unit_states[underspecced][uid]
+        assert len(state.containers) == 0
