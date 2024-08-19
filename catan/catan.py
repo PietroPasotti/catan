@@ -1417,7 +1417,7 @@ class Catan:
         """Fetch the state of a single unit from the model state."""
         _model_state = model_state or self._model_state
         try:
-            return model_state.unit_states[app][unit_id]
+            return _model_state.unit_states[app][unit_id]
         except KeyError:
             return self._dead_unit_states[app][unit_id]
 
