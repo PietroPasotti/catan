@@ -769,6 +769,56 @@ class Catan:
             )
         return found, others
 
+    def _sync_secrets(
+        self,
+        unit_id: int,
+        model_state_out: ModelState,
+        states_from: Dict[int, scenario.State],
+        binding_from: Binding,
+        binding_to: Binding,
+        queue: bool,
+    ):
+        """Detect secret creation/changes and sync them, while queuing any events."""
+        master_state = states_from[unit_id]
+        relation_from, other_relations_from = self._find_relation(
+            master_state, binding_from, binding_to
+        )
+        for secret in master_state.secrets:
+            if secret.owner is None:
+                # secret owned by binding_to.app, we can ignore it as it can't have been edited now
+                continue
+
+            # secret owned by binding_from.app: it might have been created or edited now
+            for relation_id, readers in secret.remote_grants.items():
+                # readers is a set of remote app or unit names, who have read access to the secret
+                # we need to ensure that this secret is in their states too.
+                for reader in readers:
+                    app_name, _, unit_id_str = reader.rpartition("/")
+                    app = self._get_app(app_name, model_state_out)
+
+                    if unit_id_str:
+                        # secret granted to unit: get that unit state
+                        unit_id = int(unit_id_str)
+                        target_state = model_state_out.unit_states[app][unit_id]
+                    else:
+                        # get the leader
+                        unit_id, target_state = [
+                            (i, s)
+                            for i, s in model_state_out.unit_states[app].items()
+                            if s.leader
+                        ][0]
+
+                    # if secret in state already, check for changes and update, queue secret-changed
+                    new_target_state = target_state.replace()
+
+                    # otherwise, add it to the state and queue secret-granted
+
+    def _get_app(self, name: str, model_state: Optional[ModelState] = None) -> App:
+        for app in (model_state or self._model_state).unit_states:
+            if app.name == name:
+                return app
+        raise RuntimeError(f"app {name!r} not found in model state.")
+
     def _sync_integration(
         self,
         unit_id: int,
@@ -778,6 +828,8 @@ class Catan:
         binding_to: Binding,
         queue: bool,
     ):
+        """Detect secret creation/changes and sync them, while queuing any events."""
+
         # simplifying a bit:
         # if b1's local app data is different from b2's remote app data:
         # copy it over and notify all b2 apps of the change in remote app data
@@ -978,9 +1030,15 @@ class Catan:
             self._sync_integration(
                 unit_id, model_state_out, states_out_b1, b1, b2, queue=queue
             )
+            self._sync_secrets(
+                unit_id, model_state_out, states_out_b1, b1, b2, queue=queue
+            )
 
         if app is None or app == b2.app:
             self._sync_integration(
+                unit_id, model_state_out, states_out_b2, b2, b1, queue=queue
+            )
+            self._sync_secrets(
                 unit_id, model_state_out, states_out_b2, b2, b1, queue=queue
             )
 
