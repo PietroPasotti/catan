@@ -1,11 +1,22 @@
 import random
 from unittest.mock import patch
 
+import ops
 import pytest
+from ops import CharmBase, Framework
 from ops.pebble import Layer
-from scenario import Container, Event, ExecOutput, Relation, State
+from scenario import Container, Event, ExecOutput, PeerRelation, Relation, State
 
-from catan.catan import App, Binding, Catan, Integration, ModelState, _QueueItem
+from catan.catan import (
+    App,
+    Binding,
+    Catan,
+    InconsistentStateError,
+    Integration,
+    ModelState,
+    RunState,
+    _QueueItem,
+)
 
 
 @pytest.fixture
@@ -22,6 +33,7 @@ def tempo():
 def tempo_state():
     return State(
         leader=True,
+        relations=[],
         containers=[
             Container(
                 name="tempo",
@@ -74,6 +86,7 @@ def traefik_state():
             # since we're passing a config, we have to provide all defaulted values
             "routing_mode": "path",
         },
+        relations=[PeerRelation("peers")],
         containers=[
             # unless the traefik service reports active, the
             # charm won't publish the ingress url.
@@ -87,7 +100,9 @@ def traefik_state():
                         "-name",
                         "*.yaml",
                         "-delete",
-                    ): ExecOutput()
+                    ): ExecOutput(),
+                    ("update-ca-certificates", "--fresh"): ExecOutput(),
+                    ("/usr/bin/traefik", "version"): ExecOutput(stdout="0.1"),
                 },
                 layers={
                     "foo": Layer(
@@ -196,9 +211,9 @@ def test_queue(tempo, tempo_state, traefik, traefik_state, traefik_unit_id):
         # traefik notices tempo has published receiver urls
         f"traefik/{traefik_unit_id} :: tracing_relation_changed",
     ]
-    traefik_tracing_out = ms_out.unit_states[traefik][traefik_unit_id].get_relations(
-        "tracing"
-    )[0]
+
+    traefik_state: State = ms_out.unit_states[traefik][traefik_unit_id]
+    traefik_tracing_out = traefik_state.get_relations("tracing")[0]
     assert traefik_tracing_out.remote_app_data
 
 
@@ -207,8 +222,8 @@ def test_integrate(tempo, tempo_state, traefik, traefik_state):
         ModelState(
             {
                 tempo: {
-                    0: tempo_state.replace(leader=True),
-                    1: tempo_state.replace(leader=False),
+                    0: tempo_state.replace(leader=True),  # tempo/0
+                    1: tempo_state.replace(leader=False),  # tempo/1
                 },
                 traefik: {0: traefik_state.replace(leader=True)},
             }
@@ -265,8 +280,8 @@ def test_disintegrate(tempo, tempo_state, traefik, traefik_state):
 
     assert c._emitted_repr == [
         "tempo/0 :: tracing_relation_departed(traefik/0)",
-        "tempo/1 :: tracing_relation_departed(traefik/0)",
         "tempo/0 :: tracing_relation_broken",
+        "tempo/1 :: tracing_relation_departed(traefik/0)",
         "tempo/1 :: tracing_relation_broken",
         "traefik/0 :: tracing_relation_departed(tempo/0)",
         "traefik/0 :: tracing_relation_departed(tempo/1)",
@@ -290,42 +305,40 @@ def test_run_action(tempo, tempo_state, traefik, traefik_state):
     )
     c = Catan(ms)
 
-    c.run_action("show-proxied-endpoints", traefik)
+    c.run_action("show-proxied-endpoints", traefik, 1)
 
     c.settle()
     assert c._emitted_repr == [
         "traefik/1 :: show_proxied_endpoints_action",
-        "traefik/3 :: show_proxied_endpoints_action",
+        "traefik/3 :: peers_relation_changed",
+        "traefik/1 :: peers_relation_changed",
     ]
 
 
-def test_deploy(tempo, tempo_state, traefik, traefik_state):
-    ms = ModelState(
-        {
-            tempo: {
-                0: tempo_state.replace(leader=True),
-            },
-        }
-    )
+def test_deploy(traefik, traefik_state):
+    ms = ModelState()
     c = Catan(ms)
 
-    ms_trfk = c.deploy(traefik, ids=(1, 3), state_template=traefik_state)
+    ms_trfk = c.deploy(traefik, ids=(6, 3), state_template=traefik_state)
+
     assert ms_trfk.unit_states[traefik] == {
-        1: traefik_state.replace(leader=True),
+        6: traefik_state.replace(leader=True),
         3: traefik_state.replace(leader=False),
     }
 
     c.settle()
 
     assert c._emitted_repr == [
-        "traefik/1 :: install",
-        "traefik/1 :: leader_elected",
-        "traefik/1 :: config_changed",
-        "traefik/1 :: start",
+        "traefik/6 :: install",
         "traefik/3 :: install",
+        "traefik/6 :: leader_elected",
         "traefik/3 :: leader_settings_changed",
+        "traefik/6 :: config_changed",
         "traefik/3 :: config_changed",
+        "traefik/6 :: start",
         "traefik/3 :: start",
+        "traefik/3 :: peers_relation_changed",
+        "traefik/6 :: peers_relation_changed",
     ]
 
 
@@ -343,6 +356,7 @@ def test_add_unit(tempo, tempo_state, traefik, traefik_state):
     c.settle()
 
     new_traefik_unit_state = traefik_state.replace(leader=False)
+
     ms_traefik_scaled = c.add_unit(traefik, 42, state=new_traefik_unit_state)
 
     assert set(ms_traefik_scaled.unit_states[traefik]) == {1, 3, 42}
@@ -351,17 +365,80 @@ def test_add_unit(tempo, tempo_state, traefik, traefik_state):
 
     assert c._emitted_repr == [
         "traefik/1 :: install",
-        "traefik/1 :: leader_elected",
-        "traefik/1 :: config_changed",
-        "traefik/1 :: start",
         "traefik/3 :: install",
+        "traefik/1 :: leader_elected",
         "traefik/3 :: leader_settings_changed",
+        "traefik/1 :: config_changed",
         "traefik/3 :: config_changed",
+        "traefik/1 :: start",
         "traefik/3 :: start",
+        "traefik/3 :: peers_relation_changed",
+        "traefik/1 :: peers_relation_changed",
         "traefik/42 :: install",
+        "traefik/1 :: leader_elected",
+        "traefik/3 :: leader_settings_changed",
         "traefik/42 :: leader_settings_changed",
         "traefik/42 :: config_changed",
         "traefik/42 :: start",
+        "traefik/1 :: peers_relation_changed",
+        "traefik/3 :: peers_relation_changed",
+        "traefik/42 :: peers_relation_changed",
+    ]
+
+
+def test_add_unit_create_peers(tempo, tempo_state, traefik, traefik_state):
+    ms = ModelState(
+        {
+            tempo: {
+                0: tempo_state.replace(leader=True),
+            },
+        }
+    )
+    c = Catan(ms)
+    traefik_state_no_peers = traefik_state.replace(relations=[])
+    c.deploy(traefik, ids=(1, 3), state_template=traefik_state_no_peers)
+    c.settle()
+
+    new_traefik_unit_state = traefik_state_no_peers.replace(leader=False)
+
+    ms_traefik_scaled = c.add_unit(traefik, 42, state=new_traefik_unit_state)
+
+    assert set(ms_traefik_scaled.unit_states[traefik]) == {1, 3, 42}
+    assert (
+        ms_traefik_scaled.unit_states[traefik][42].replace(relations=[])
+        == new_traefik_unit_state
+    )
+    assert len(ms_traefik_scaled.unit_states[traefik][42].get_relations("peers")) == 1
+    c.settle()
+
+    assert c._emitted_repr == [
+        "traefik/1 :: install",
+        "traefik/3 :: install",
+        "traefik/1 :: peers_relation_created",
+        "traefik/1 :: peers_relation_joined(traefik/3)",
+        "traefik/1 :: peers_relation_changed",
+        "traefik/3 :: peers_relation_created",
+        "traefik/3 :: peers_relation_joined(traefik/1)",
+        "traefik/3 :: peers_relation_changed",
+        "traefik/1 :: leader_elected",
+        "traefik/3 :: leader_settings_changed",
+        "traefik/1 :: config_changed",
+        "traefik/3 :: config_changed",
+        "traefik/1 :: start",
+        "traefik/3 :: start",
+        "traefik/42 :: install",
+        "traefik/42 :: peers_relation_created",
+        "traefik/42 :: peers_relation_joined(traefik/1)",
+        "traefik/42 :: peers_relation_joined(traefik/3)",
+        "traefik/42 :: peers_relation_changed",
+        "traefik/1 :: leader_elected",
+        "traefik/3 :: leader_settings_changed",
+        "traefik/42 :: leader_settings_changed",
+        "traefik/42 :: config_changed",
+        "traefik/42 :: start",
+        "traefik/1 :: peers_relation_changed",
+        "traefik/3 :: peers_relation_changed",
+        "traefik/42 :: peers_relation_changed",
     ]
 
 
@@ -447,8 +524,8 @@ def test_remove_related_app(tempo, tempo_state, traefik, traefik_state):
 
     assert c._emitted_repr == [
         "tempo/0 :: tracing_relation_departed(traefik/0)",
-        "tempo/1 :: tracing_relation_departed(traefik/0)",
         "tempo/0 :: tracing_relation_broken",
+        "tempo/1 :: tracing_relation_departed(traefik/0)",
         "tempo/1 :: tracing_relation_broken",
         "traefik/0 :: tracing_relation_departed(tempo/0)",
         "traefik/0 :: tracing_relation_departed(tempo/1)",
@@ -477,11 +554,13 @@ def test_shuffle(tempo, tempo_state, traefik, traefik_state):
         "traefik/1 :: install",
         "traefik/3 :: install",
         "traefik/1 :: leader_elected",
-        "traefik/1 :: config_changed",
         "traefik/3 :: leader_settings_changed",
-        "traefik/1 :: start",
+        "traefik/1 :: config_changed",
         "traefik/3 :: config_changed",
+        "traefik/1 :: start",
         "traefik/3 :: start",
+        "traefik/3 :: peers_relation_changed",
+        "traefik/1 :: peers_relation_changed",
     ]
 
 
@@ -497,15 +576,51 @@ def test_shuffle_nonsequential(tempo, tempo_state, traefik, traefik_state):
 
     # anything goes
     assert c._emitted_repr == [
+        "traefik/1 :: start",
         "traefik/3 :: config_changed",
         "traefik/3 :: leader_settings_changed",
-        "traefik/1 :: start",
-        "traefik/1 :: leader_elected",
-        "traefik/3 :: start",
         "traefik/3 :: install",
+        "traefik/3 :: start",
         "traefik/1 :: config_changed",
+        "traefik/1 :: leader_elected",
         "traefik/1 :: install",
+        "traefik/3 :: peers_relation_changed",
+        "traefik/1 :: peers_relation_changed",
     ]
+
+
+def test_config(tempo, tempo_state, traefik, traefik_state):
+    ms = ModelState(
+        {
+            traefik: {
+                0: traefik_state.replace(leader=True),
+                2: traefik_state.replace(leader=False),
+            },
+        }
+    )
+    c = Catan(ms)
+    c.configure(traefik, external_hostname="foo.com")
+    c.settle()
+
+    assert c._emitted_repr == [
+        "traefik/0 :: config_changed",
+        "traefik/2 :: config_changed",
+        "traefik/0 :: peers_relation_changed",
+    ]
+
+
+def test_config_bad_value(tempo, tempo_state, traefik, traefik_state):
+    ms = ModelState(
+        {
+            traefik: {
+                0: traefik_state.replace(leader=True),
+                2: traefik_state.replace(leader=False),
+            },
+        }
+    )
+    c = Catan(ms)
+    with pytest.raises(InconsistentStateError):
+        c.configure(traefik, gobble="dobble")
 
 
 def test_imatrix_fill(tempo, tempo_state, traefik, traefik_state):
@@ -561,3 +676,219 @@ def test_imatrix_fill(tempo, tempo_state, traefik, traefik_state):
         ms_final.unit_states[tempo][1].get_relations("tracing")[0].local_app_data
     )
     assert tempo0_tracing_app_data == tempo1_tracing_app_data
+
+
+def test_pebble_ready_all(tempo, tempo_state, traefik, traefik_state):
+    ms = ModelState(
+        {
+            tempo: {
+                0: tempo_state.replace(leader=True).with_can_connect("tempo", False),
+                1: tempo_state.replace(leader=False).with_can_connect("tempo", False),
+            },
+            traefik: {
+                0: traefik_state.replace(leader=True).with_can_connect("traefik", False)
+            },
+        }
+    )
+    c = Catan(ms)
+    ms_pebble_ready = c.pebble_ready()
+
+    assert c._queue_repr == [
+        "tempo/0 :: tempo_pebble_ready",
+        "tempo/1 :: tempo_pebble_ready",
+        "traefik/0 :: traefik_pebble_ready",
+    ]
+
+    # check we've connected all
+    for states in ms_pebble_ready.unit_states.values():
+        for state in states.values():
+            for container in state.containers:
+                assert container.can_connect
+
+
+def test_pebble_ready_one(tempo, tempo_state, traefik, traefik_state):
+    ms = ModelState(
+        {
+            tempo: {
+                0: tempo_state.replace(leader=True).with_can_connect("tempo", False),
+                1: tempo_state.replace(leader=False).with_can_connect("tempo", False),
+            },
+            traefik: {
+                0: traefik_state.replace(leader=True).with_can_connect("traefik", False)
+            },
+        }
+    )
+    c = Catan(ms)
+    ms_pebble_ready = c.pebble_ready(tempo, 1, "tempo")
+
+    assert c._queue_repr == [
+        "tempo/1 :: tempo_pebble_ready",
+    ]
+
+    # check we've connected only tempo/1:tempo
+    unit_states = ms_pebble_ready.unit_states
+    assert not unit_states[tempo][0].get_container("tempo").can_connect
+    assert unit_states[tempo][1].get_container("tempo").can_connect
+    assert not unit_states[traefik][0].get_container("traefik").can_connect
+
+
+@pytest.fixture
+def charmander():
+    class Charm(CharmBase):
+        META = {"name": "ander"}
+
+        def __init__(self, framework: Framework):
+            super().__init__(framework)
+            framework.observe(self.on.start, self._on_start)
+            framework.observe(self.on.install, self._on_install)
+
+        def _on_install(self, _):
+            self.unit.status = ops.BlockedStatus()
+
+        def _on_start(self, _):
+            self.unit.status = ops.ActiveStatus()
+
+    return App.from_type(Charm, meta=Charm.META)
+
+
+def test_scale(charmander):
+    c = Catan()
+
+    def assert_scale(s):
+        assert len(c.model_state.unit_states[charmander]) == s
+
+    c.deploy(charmander, ids=[1, 2])
+    assert_scale(2)
+
+    c.scale(charmander, 10)
+    assert_scale(10)
+
+    c.scale(charmander, 3)
+    assert_scale(3)
+
+    c.scale(charmander, 0)
+    assert_scale(0)
+
+
+def test_until_runstate_nproc(charmander):
+    c = Catan()
+    c.deploy(charmander, ids=[0, 3, 45])
+
+    nproc = []
+
+    def stop(rs: RunState):
+        nproc.append(rs.n_processed_events)
+        return False
+
+    c.settle(on_event=stop)
+
+    assert nproc == list(range(1, 13))
+
+
+def test_until_runstate_last_seen(charmander):
+    c = Catan()
+
+    c.deploy(charmander, ids=[0, 3, 45])
+    c.queue("update-status")
+
+    status_history = set()
+    rs_seen = []
+
+    def on_event(rs: RunState):
+        # on_event as soon as tempo becomes active
+        rs_seen.append(rs)
+        current_status = rs.last_item.state_out.unit_status.name
+        if current_status == "active":
+            return True
+        status_history.add(current_status)
+        return False
+
+    c.settle(on_event=on_event)
+
+    assert (
+        len(c._event_queue) == 5
+    )  # 2 start events for units 3 and 45, plus a round of update-status
+    assert rs_seen[-1].next_item.event.name == "start"
+    assert status_history == {"blocked"}
+
+
+@pytest.fixture
+def underspecced():
+    class Charm(CharmBase):
+        META = {
+            "name": "ander",
+            "peers": {"foo": {"interface": "bar"}},
+            "containers": {"rob": {}},
+        }
+
+        def __init__(self, framework: Framework):
+            super().__init__(framework)
+            framework.observe(self.on.start, self._on_start)
+            framework.observe(self.on.install, self._on_install)
+
+        def _on_install(self, _):
+            self.unit.status = ops.BlockedStatus()
+
+        def _on_start(self, _):
+            self.unit.status = ops.ActiveStatus()
+
+    return App.from_type(Charm, meta=Charm.META)
+
+
+def test_peer_autocreation(underspecced):
+    c = Catan()
+
+    # if we omit peer relations from the state
+    uids = [0, 3, 45]
+    ms_out = c.deploy(underspecced, ids=uids, state_template=State())
+
+    for uid in uids:
+        state = ms_out.unit_states[underspecced][uid]
+        assert len(state.relations) == 1
+        peer_rel = state.relations[0]
+        assert peer_rel.endpoint == "foo"
+        assert peer_rel.peers_data == {
+            other_uid: {} for other_uid in uids if other_uid != uid
+        }
+
+
+def test_peer_autocreation_off(underspecced):
+    c = Catan()
+    c._auto_create_peer_relations_on_deploy = False
+
+    # if we omit peer relations from the state
+    uids = [0, 3, 45]
+    ms_out = c.deploy(underspecced, ids=uids, state_template=State())
+
+    for uid in uids:
+        state = ms_out.unit_states[underspecced][uid]
+        assert len(state.relations) == 0
+
+
+def test_container_autocreation(underspecced):
+    c = Catan()
+
+    # if we omit containers from the state template
+    uids = [0, 3, 45]
+    ms_out = c.deploy(underspecced, ids=uids, state_template=State())
+
+    # catan has created them for us
+    for uid in uids:
+        state = ms_out.unit_states[underspecced][uid]
+        assert len(state.containers) == 1
+        container = state.containers[0]
+        assert container == Container("rob")
+
+
+def test_container_autocreation_off(underspecced):
+    c = Catan()
+    c._auto_create_containers_on_deploy = False
+
+    # if we omit containers from the state template
+    uids = [0, 3, 45]
+    ms_out = c.deploy(underspecced, ids=uids, state_template=State())
+
+    # catan has created them for us
+    for uid in uids:
+        state = ms_out.unit_states[underspecced][uid]
+        assert len(state.containers) == 0

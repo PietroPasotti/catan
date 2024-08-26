@@ -7,7 +7,21 @@ Let's break it down:
 - It's testing framework-agnostic.
 - It's built on top of [`ops-scenario`](https://github.com/canonical/ops-scenario).
 - It's mainly meant for testing the integration between different charms as they communicate over relation data.
+- It's about integration testing the charms (and the way they interact with the juju model): NOT the workloads and NOT the substrate they are running on.
 
+Catan is a **juju model-level simulation tool**.
+
+- It allows you to simulate a single juju model.
+- It doesn't simulate the workloads, the cloud substrate: only The Juju Model of things:
+  - What applications are there
+  - What units they have
+  - How the apps are integrated
+- It simulates certain dynamic aspects of the model lifecycle too:
+  - The admin runs an action
+  - The admin deploys a new app, or scales an existing one up/down
+  - The admin integrates/disintegrates two endpoints
+
+  
 ## Why not scenario?
 
 Scenario operates at the level of the single charm unit execution: **one charm instance, one juju event** at a time. In order to practically verify the interaction between two charms, one has to continually manually play the role of the 'remote' unit and mock the relation data it would present or reply with in a given interaction.
@@ -28,16 +42,109 @@ While the primary data structure you play with in Scenario is the `State` (which
     - The unit IDs and `scenario.State`s of each individual unit of the app.
 - The list of `Integrations` present in the model.
 
+Usage:
+
+```python
+from scenario import State
+
+from catan import ModelState, App, Integration, Catan
+
+app1 = App(...)
+app2 = App(...)
+
+foo_bar_integration = Integration.from_endpoints(app1, "foo", app2, "bar")
+ms = ModelState(
+    unit_states={
+        app1: {0: State()},
+        app2: {0: State()},
+    },
+    integrations=[
+        foo_bar_integration
+    ]
+)
+
+c = Catan(ms)
+# do things with catan, such as
+ms_out: ModelState = c.disintegrate(foo_bar_integration)
+
+# the integration is gone from the model state:
+assert not ms_out.integrations
+
+# and catan has queued relation-departed, relation-broken events on all affected units.
+assert c._event_queue
+
+# execute all queued events
+c.settle()
+```
+
 ### App
 
 The `App` data structure encapsulates:
 - App name, such as "nginx"
 - Charm source and metadata (yes, a physical charm's source code)
 
+Usage:
+
+```python
+from ops import CharmBase
+from scenario import State
+from catan import ModelState, App, Catan
+
+
+class MyCharm(CharmBase):
+    ...
+
+
+app1 = App.from_git("canonical", "traefik-k8s")
+app2 = App.from_type(MyCharm, "mycharm")
+app3 = App.from_path("/path/to/local/charm/repo", "local-charm")
+
+# use it to declaratively set up a model...
+ms = ModelState(
+    unit_states={
+        app1: {0: State()},
+        app2: {0: State()},
+        app3: {0: State()},
+    }
+)
+
+# ... or use it to imperatively do the same
+c = Catan()
+c.deploy(app1)
+c.deploy(app2)
+c.deploy(app3)
+```
+
+
 ### Integration
 
 The `Integration` data structure encapsulates:
 - Two Apps and the endpoints by which they are integrated.
+
+```python
+from scenario import State
+from catan import ModelState, App, Integration, Catan
+
+app1 = App(...)
+app2 = App(...)
+
+# use it to declaratively set up a model...
+ms = ModelState(
+    unit_states={
+        app1: {0: State()},
+        app2: {0: State()},
+    },
+    integrations=[
+        Integration.from_endpoints(app1, "foo", app2, "bar")
+    ]
+)
+
+# ...or use it to imperatively do the same
+c = Catan()
+c.deploy(app1)
+c.deploy(app2)
+c.integrate(app1, "foo", app2, "bar")
+```
 
 
 # Using Catan
@@ -79,8 +186,9 @@ def test_integrate():
         patches=[
             patch("charm.KubernetesServicePatch")
         ])
-    traefik = App.from_path(
-        "/path/to/traefik-k8s-operator/",
+    traefik = App.from_git(
+        "canonical",
+        "traefik-k8s-operator",
         patches=[
             patch("charm.KubernetesServicePatch")
         ])
@@ -100,6 +208,7 @@ def test_integrate():
     # output is the model state in its final form
     ms: ModelState = c.settle()
     
+    # we can inspect what has been emitted by catan
     assert c._emitted_repr == [
         # this is the initial event sequence, programmed by juju
         'tempo/0 :: tracing_relation_created',
@@ -273,6 +382,22 @@ Typically, on `relation-changed` events, a charm can write data to their side of
 So usually you'll see a back-and-forth of `relation-changed` events until the charms settle and stop reacting to one another's writes, depending on the protocol.
 
 
+## Running actions
+Running actions is done via the `run_action` API. 
+
+```python
+from catan import Catan, App
+from scenario import Action
+
+c = Catan()
+app1 = App.from_git("canonical", "tempo-k8s")
+c.deploy(app1)
+
+c.run_action("do-something", app1)  # on all units
+c.run_action("do-something", app1, 0)  # on app1/0
+c.run_action(Action("do-something", params={"foo": "bar"}), app1, 0)  # with parameters
+```
+
 ## Randomization
 After you've populated the event queue, you can call `Catan.shuffle()` to randomize it in a way that still makes juju-sense. For example, a `start` event should not precede an `install` event.
 `Catan.shuffle()` ensures that the event sequences can interleave with other sequences, while their internal relative ordering remains intact.
@@ -288,4 +413,4 @@ with c.fixed_sequence():
   c.queue("stop", app, 0)
 ```
 
-This will make sure that, if you do `c.shuffle()`, the stop event will always fire after update-status does.
+This will make sure that, if you do `c.shuffle()`, the relative position of `stop` relative to `update-status` will remain unchanged in the queue.

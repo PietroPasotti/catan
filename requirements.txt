@@ -1,4 +1,4 @@
-ops-scenario
+ops-scenario>=6.1.1
 pytest
 deepmerge
 cosl
