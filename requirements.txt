@@ -1,4 +1,4 @@
-ops-scenario>=6.1.1
+ops-scenario @ git+https://github.com/canonical/ops-scenario@remap
 pytest
 deepmerge
 cosl

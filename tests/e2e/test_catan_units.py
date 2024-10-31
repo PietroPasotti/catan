@@ -1,11 +1,13 @@
 import random
+from dataclasses import replace
 from unittest.mock import patch
 
 import ops
 import pytest
 from ops import CharmBase, Framework
 from ops.pebble import Layer
-from scenario import Container, Event, ExecOutput, PeerRelation, Relation, State
+from scenario import Container, Exec, PeerRelation, Relation, State
+from scenario.state import _Event
 
 from catan.catan import (
     App,
@@ -93,16 +95,18 @@ def traefik_state():
             Container(
                 name="traefik",
                 can_connect=True,
-                exec_mock={
-                    (
-                        "find",
-                        "/opt/traefik/juju",
-                        "-name",
-                        "*.yaml",
-                        "-delete",
-                    ): ExecOutput(),
-                    ("update-ca-certificates", "--fresh"): ExecOutput(),
-                    ("/usr/bin/traefik", "version"): ExecOutput(stdout="0.1"),
+                execs={
+                    Exec(command_prefix=("update-ca-certificates", "--fresh")),
+                    Exec(command_prefix=("/usr/bin/traefik", "version"), stdout="0.1"),
+                    Exec(
+                        command_prefix=(
+                            "find",
+                            "/opt/traefik/juju",
+                            "-name",
+                            "*.yaml",
+                            "-delete",
+                        )
+                    ),
                 },
                 layers={
                     "foo": Layer(
@@ -161,14 +165,14 @@ def test_event_queue_expansion(tempo, tempo_state, traefik, traefik_state):
     ms = ModelState(
         {
             tempo: {
-                1: tempo_state.replace(leader=True),
-                3: tempo_state.replace(leader=False),
+                1: replace(tempo_state, leader=True),
+                3: replace(tempo_state, leader=False),
             },
-            traefik: {0: traefik_state.replace(leader=True)},
+            traefik: {0: replace(traefik_state, leader=True)},
         }
     )
     c = Catan(ms)
-    qitem = _QueueItem(Event("update-status"), None, None, None)
+    qitem = _QueueItem(c.on.update_status(), None, None, None)
     expanded = tuple(c._expand_queue_item(ms, qitem))
 
     assert len(expanded) == 3  # one update-status per unit
@@ -187,10 +191,12 @@ def test_queue(tempo, tempo_state, traefik, traefik_state, traefik_unit_id):
     ms = ModelState(
         {
             tempo: {
-                1: tempo_state.replace(leader=True),  # tempo/1
-                2: tempo_state.replace(leader=False),  # tempo/2
+                1: replace(tempo_state, leader=True),  # tempo/1
+                2: replace(tempo_state, leader=False),  # tempo/2
             },
-            traefik: {traefik_unit_id: traefik_state.replace(leader=True)},  # traefik/0
+            traefik: {
+                traefik_unit_id: replace(traefik_state, leader=True)
+            },  # traefik/0
         },
         integrations=[
             Integration(
@@ -200,7 +206,10 @@ def test_queue(tempo, tempo_state, traefik, traefik_state, traefik_unit_id):
         ],
     )
     c = Catan(ms)
-    c.queue(Relation("tracing", remote_app_name="tempo").created_event, traefik)
+    c.queue(
+        c.on.relation_created("tracing", tempo),
+        traefik,
+    )
     ms_out = c.settle()
 
     assert c._emitted_repr == [
@@ -222,10 +231,10 @@ def test_integrate(tempo, tempo_state, traefik, traefik_state):
         ModelState(
             {
                 tempo: {
-                    0: tempo_state.replace(leader=True),  # tempo/0
-                    1: tempo_state.replace(leader=False),  # tempo/1
+                    0: replace(tempo_state, leader=True),  # tempo/0
+                    1: replace(tempo_state, leader=False),  # tempo/1
                 },
-                traefik: {0: traefik_state.replace(leader=True)},
+                traefik: {0: replace(traefik_state, leader=True)},
             }
         )
     )
@@ -246,7 +255,6 @@ def test_integrate(tempo, tempo_state, traefik, traefik_state):
         "traefik/0 :: tracing_relation_changed",
         "tempo/0 :: tracing_relation_changed",
         "tempo/1 :: tracing_relation_changed",
-        "traefik/0 :: tracing_relation_changed",
     ]
     traefik_tracing_out = ms_final.unit_states[traefik][0].get_relations("tracing")[0]
     assert traefik_tracing_out.remote_app_data
@@ -267,10 +275,10 @@ def test_disintegrate(tempo, tempo_state, traefik, traefik_state):
     ms = ModelState(
         {
             tempo: {
-                0: tempo_state.replace(leader=True),
-                1: tempo_state.replace(leader=False),
+                0: replace(tempo_state, leader=True),
+                1: replace(tempo_state, leader=False),
             },
-            traefik: {0: traefik_state.replace(leader=True)},
+            traefik: {0: replace(traefik_state, leader=True)},
         },
         integrations=[integration],
     )
@@ -295,11 +303,11 @@ def test_run_action(tempo, tempo_state, traefik, traefik_state):
     ms = ModelState(
         {
             tempo: {
-                0: tempo_state.replace(leader=True),
+                0: replace(tempo_state, leader=True),
             },
             traefik: {
-                1: traefik_state.replace(leader=True),
-                3: traefik_state.replace(leader=False),
+                1: replace(traefik_state, leader=True),
+                3: replace(traefik_state, leader=False),
             },
         }
     )
@@ -322,8 +330,8 @@ def test_deploy(traefik, traefik_state):
     ms_trfk = c.deploy(traefik, ids=(6, 3), state_template=traefik_state)
 
     assert ms_trfk.unit_states[traefik] == {
-        6: traefik_state.replace(leader=True),
-        3: traefik_state.replace(leader=False),
+        6: replace(traefik_state, leader=True),
+        3: replace(traefik_state, leader=False),
     }
 
     c.settle()
@@ -346,7 +354,7 @@ def test_add_unit(tempo, tempo_state, traefik, traefik_state):
     ms = ModelState(
         {
             tempo: {
-                0: tempo_state.replace(leader=True),
+                0: replace(tempo_state, leader=True),
             },
         }
     )
@@ -355,7 +363,7 @@ def test_add_unit(tempo, tempo_state, traefik, traefik_state):
     c.deploy(traefik, ids=(1, 3), state_template=traefik_state)
     c.settle()
 
-    new_traefik_unit_state = traefik_state.replace(leader=False)
+    new_traefik_unit_state = replace(traefik_state, leader=False)
 
     ms_traefik_scaled = c.add_unit(traefik, 42, state=new_traefik_unit_state)
 
@@ -390,22 +398,22 @@ def test_add_unit_create_peers(tempo, tempo_state, traefik, traefik_state):
     ms = ModelState(
         {
             tempo: {
-                0: tempo_state.replace(leader=True),
+                0: replace(tempo_state, leader=True),
             },
         }
     )
     c = Catan(ms)
-    traefik_state_no_peers = traefik_state.replace(relations=[])
+    traefik_state_no_peers = replace(traefik_state, relations=[])
     c.deploy(traefik, ids=(1, 3), state_template=traefik_state_no_peers)
     c.settle()
 
-    new_traefik_unit_state = traefik_state_no_peers.replace(leader=False)
+    new_traefik_unit_state = replace(traefik_state_no_peers, leader=False)
 
     ms_traefik_scaled = c.add_unit(traefik, 42, state=new_traefik_unit_state)
 
     assert set(ms_traefik_scaled.unit_states[traefik]) == {1, 3, 42}
     assert (
-        ms_traefik_scaled.unit_states[traefik][42].replace(relations=[])
+        replace(ms_traefik_scaled.unit_states[traefik][42], relations=[])
         == new_traefik_unit_state
     )
     assert len(ms_traefik_scaled.unit_states[traefik][42].get_relations("peers")) == 1
@@ -446,8 +454,8 @@ def test_remove_unit(tempo, tempo_state, traefik, traefik_state):
     ms = ModelState(
         {
             tempo: {
-                0: tempo_state.replace(leader=True),
-                1: tempo_state.replace(leader=False),
+                0: replace(tempo_state, leader=True),
+                1: replace(tempo_state, leader=False),
             },
         }
     )
@@ -475,8 +483,8 @@ def test_remove_app(tempo, tempo_state, traefik, traefik_state):
     ms = ModelState(
         {
             tempo: {
-                0: tempo_state.replace(leader=True),
-                1: tempo_state.replace(leader=False),
+                0: replace(tempo_state, leader=True),
+                1: replace(tempo_state, leader=False),
             },
         }
     )
@@ -502,10 +510,10 @@ def test_remove_related_app(tempo, tempo_state, traefik, traefik_state):
     ms = ModelState(
         {
             tempo: {
-                0: tempo_state.replace(leader=True),
-                1: tempo_state.replace(leader=False),
+                0: replace(tempo_state, leader=True),
+                1: replace(tempo_state, leader=False),
             },
-            traefik: {0: traefik_state.replace(leader=True)},
+            traefik: {0: replace(traefik_state, leader=True)},
         },
         integrations=[
             Integration(
@@ -593,8 +601,8 @@ def test_config(tempo, tempo_state, traefik, traefik_state):
     ms = ModelState(
         {
             traefik: {
-                0: traefik_state.replace(leader=True),
-                2: traefik_state.replace(leader=False),
+                0: replace(traefik_state, leader=True),
+                2: replace(traefik_state, leader=False),
             },
         }
     )
@@ -613,8 +621,8 @@ def test_config_bad_value(tempo, tempo_state, traefik, traefik_state):
     ms = ModelState(
         {
             traefik: {
-                0: traefik_state.replace(leader=True),
-                2: traefik_state.replace(leader=False),
+                0: replace(traefik_state, leader=True),
+                2: replace(traefik_state, leader=False),
             },
         }
     )
@@ -627,10 +635,10 @@ def test_imatrix_fill(tempo, tempo_state, traefik, traefik_state):
     ms = ModelState(
         {
             tempo: {
-                0: tempo_state.replace(leader=True),
-                1: tempo_state.replace(leader=False),
+                0: replace(tempo_state, leader=True),
+                1: replace(tempo_state, leader=False),
             },
-            traefik: {0: traefik_state.replace(leader=True)},
+            traefik: {0: replace(traefik_state, leader=True)},
         }
     )
     c = Catan(ms)
@@ -682,11 +690,13 @@ def test_pebble_ready_all(tempo, tempo_state, traefik, traefik_state):
     ms = ModelState(
         {
             tempo: {
-                0: tempo_state.replace(leader=True).with_can_connect("tempo", False),
-                1: tempo_state.replace(leader=False).with_can_connect("tempo", False),
+                0: replace(tempo_state, leader=True).with_can_connect("tempo", False),
+                1: replace(tempo_state, leader=False).with_can_connect("tempo", False),
             },
             traefik: {
-                0: traefik_state.replace(leader=True).with_can_connect("traefik", False)
+                0: replace(traefik_state, leader=True).with_can_connect(
+                    "traefik", False
+                )
             },
         }
     )
@@ -710,11 +720,13 @@ def test_pebble_ready_one(tempo, tempo_state, traefik, traefik_state):
     ms = ModelState(
         {
             tempo: {
-                0: tempo_state.replace(leader=True).with_can_connect("tempo", False),
-                1: tempo_state.replace(leader=False).with_can_connect("tempo", False),
+                0: replace(tempo_state, leader=True).with_can_connect("tempo", False),
+                1: replace(tempo_state, leader=False).with_can_connect("tempo", False),
             },
             traefik: {
-                0: traefik_state.replace(leader=True).with_can_connect("traefik", False)
+                0: replace(traefik_state, leader=True).with_can_connect(
+                    "traefik", False
+                )
             },
         }
     )
@@ -888,7 +900,7 @@ def test_container_autocreation_off(underspecced):
     uids = [0, 3, 45]
     ms_out = c.deploy(underspecced, ids=uids, state_template=State())
 
-    # catan has created them for us
+    # catan does not create them for us
     for uid in uids:
         state = ms_out.unit_states[underspecced][uid]
         assert len(state.containers) == 0

@@ -9,6 +9,7 @@ import tempfile
 import typing
 from collections import defaultdict
 from contextlib import contextmanager
+from dataclasses import replace
 from functools import partial
 from importlib import import_module
 from itertools import chain, count
@@ -28,9 +29,17 @@ from typing import (
 
 import scenario  # pyright: ignore[reportMissingImports]
 from ops import CharmBase
-from scenario import consistency_checker  # pyright: ignore[reportMissingImports]
-from scenario.runtime import UncaughtCharmError
-from scenario.state import _CharmSpec, _DCBase  # pyright: ignore[reportMissingImports]
+from scenario import (
+    Secret,
+    State,
+)  # pyright: ignore[reportMissingImports]
+from scenario._consistency_checker import Results, check_config_consistency  # noqa
+from scenario.context import CharmEvents
+from scenario.state import (
+    _CharmSpec,
+    _Event,
+    _Action,
+)  # pyright: ignore[reportMissingImports]
 
 if typing.TYPE_CHECKING:
     from scenario.state import AnyRelation
@@ -136,7 +145,7 @@ class RunState:
 
 
 @dataclasses.dataclass(frozen=True)
-class App(_DCBase):
+class App:
     """Application."""
 
     charm: _CharmSpec
@@ -291,13 +300,13 @@ class App(_DCBase):
 
 
 @dataclasses.dataclass(frozen=True)
-class Binding(_DCBase):
+class Binding:
     """Integration endpoint binding."""
 
     app: App
     endpoint: str
-    relation_id: int = dataclasses.field(
-        default_factory=scenario.state.next_relation_id
+    id: int = dataclasses.field(
+        default_factory=scenario.state._next_relation_id  # noqa
     )
 
     local_app_data: Dict[str, str] = dataclasses.field(default_factory=dict)
@@ -309,12 +318,15 @@ class Binding(_DCBase):
         default_factory=dict
     )
 
+    def __hash__(self) -> int:
+        return hash(self.id)
+
     def __repr__(self):
-        return f"<Binding {self.app.name}:{self.endpoint} ({self.relation_id})>"
+        return f"<Binding {self.app.name}:{self.endpoint} ({self.id})>"
 
 
 @dataclasses.dataclass(frozen=True)
-class Integration(_DCBase):
+class Integration:
     """Juju integration."""
 
     binding1: Binding
@@ -337,18 +349,18 @@ class Integration(_DCBase):
             scenario.Relation(
                 endpoint=self.binding1.endpoint,
                 remote_app_name=self.binding2.app.name,
-                relation_id=self.binding1.relation_id,
+                id=self.binding1.id,
             ),
             scenario.Relation(
                 endpoint=self.binding2.endpoint,
                 remote_app_name=self.binding1.app.name,
-                relation_id=self.binding2.relation_id,
+                id=self.binding2.id,
             ),
         )
 
 
 @dataclasses.dataclass(frozen=True)
-class ModelState(_DCBase):
+class ModelState:
     """Model state."""
 
     unit_states: Dict[App, Dict[int, scenario.State]] = dataclasses.field(
@@ -373,7 +385,7 @@ _qitem_counter = count()
 
 @dataclasses.dataclass
 class _QueueItem:
-    event: scenario.Event
+    event: _Event
     app: Optional[App]
     unit_id: Optional[Optional[int]]
     group: Optional[int] = None
@@ -397,10 +409,13 @@ class _QueueItem:
         remote_unit = ""
         if self.event.relation_remote_unit_id is not None:
             relation = self.event.relation
+            assert (
+                relation
+            ), f"Event {self.event} has .relation_remote_unit_id set but no .relation"
             if isinstance(relation, scenario.PeerRelation):
                 remote_app_name = self.app.name
             else:
-                remote_app_name = relation.remote_app_name
+                remote_app_name = relation.remote_app_name  # type: ignore
             remote_unit = f"({remote_app_name}/{self.event.relation_remote_unit_id})"
 
         return f"{cast(App, self.app).name}/{self.unit_id} :: {self.event.path}{remote_unit}"
@@ -410,9 +425,74 @@ class _QueueItem:
 
 
 @dataclasses.dataclass(frozen=True)
-class _HistoryItem(_DCBase):
+class _HistoryItem:
     item: _QueueItem
     state_out: scenario.State
+
+
+class _UnboundEvent:
+    def __init__(self, bind_fn: Callable[["Catan", App], _Event]):
+        self._bind_fn = bind_fn
+
+    def bind(self, catan: "Catan", app: App):
+        return self._bind_fn(catan=catan, app=app)
+
+
+class _PartiallyBoundCharmEvents(CharmEvents):
+    @staticmethod
+    def _relation_event(endpoint: str, evt_name: str, other: App, **kwargs):
+        def bind(catan: Catan, app: App):
+            relation = catan._get_relation(app, endpoint, other)
+            return getattr(CharmEvents, evt_name)(relation, **kwargs)
+
+        return _UnboundEvent(bind)
+
+    @staticmethod
+    def relation_joined(
+        endpoint: str, other: App, *, remote_unit: Optional[int] = None
+    ):
+        return _PartiallyBoundCharmEvents._relation_event(
+            endpoint, "relation_joined", other, remote_unit=remote_unit
+        )
+
+    @staticmethod
+    def relation_created(endpoint: str, other: App):
+        return _PartiallyBoundCharmEvents._relation_event(
+            endpoint, "relation_created", other
+        )
+
+    @staticmethod
+    def relation_changed(
+        endpoint: str,
+        other: App,
+        *,
+        remote_unit: Optional[int] = None,
+    ):
+        return _PartiallyBoundCharmEvents._relation_event(
+            endpoint, "relation_changed", other, remote_unit=remote_unit
+        )
+
+    @staticmethod
+    def relation_departed(
+        endpoint: str,
+        other: App,
+        *,
+        remote_unit: Optional[int] = None,
+        departing_unit: Optional[int] = None,
+    ):
+        return _PartiallyBoundCharmEvents._relation_event(
+            endpoint,
+            "relation_departed",
+            other=other,
+            remote_unit=remote_unit,
+            departing_unit=departing_unit,
+        )
+
+    @staticmethod
+    def relation_broken(endpoint: str, other: App):
+        return _PartiallyBoundCharmEvents._relation_event(
+            endpoint, "relation_broken", other=other
+        )
 
 
 class Catan:
@@ -444,6 +524,8 @@ class Catan:
 
         self._fixed_sequence_counter = 0
         self._current_group = None
+        self.on = _PartiallyBoundCharmEvents()
+        self.bound_on = _PartiallyBoundCharmEvents()
 
     @property
     def model_state(self) -> ModelState:
@@ -462,7 +544,7 @@ class Catan:
 
     def queue(
         self,
-        event: Union[scenario.Event, str],
+        event: Union[_Event, _UnboundEvent, str],
         app: Optional[App] = None,
         unit_id: Optional[int] = None,
     ):
@@ -477,17 +559,22 @@ class Catan:
         >>> c.deploy(App.from_path("/path/to/my/charm/repo"), ids=[0, 1, 2])
         >>> c.queue("update-status")
         """
+
+        if isinstance(event, _UnboundEvent):
+            logger.debug("binding unbound event before queuing it...")
+            event = event.bind(catan=self, app=app)
+
         self._queue(self._model_state, event, app, unit_id)
 
     def _queue(
         self,
         model_state: ModelState,
-        event: Union[str, scenario.Event],
+        event: Union[str, _Event],
         app: Optional[App] = None,
         unit_id: Optional[int] = None,
     ) -> Tuple[_QueueItem, ...]:
         if isinstance(event, str):
-            event = scenario.Event(event)
+            event = _Event(event)
 
         qitem = _QueueItem(event, app, unit_id, group=self._current_group)
         expanded = tuple(self._expand_queue_item(model_state, qitem))
@@ -595,7 +682,7 @@ class Catan:
 
         if i == 0:
             logger.warning(
-                "scenario.Event queue empty: converged in zero iterations. "
+                "_Event queue empty: converged in zero iterations. "
                 "scenario.Model state unchanged (modulo initial sync)."
             )
             return self._final_sync(model_state)
@@ -619,7 +706,7 @@ class Catan:
 
     def fire(
         self,
-        event: Union[str, scenario.Event],
+        event: Union[str, _Event],
         app: App,
         unit_id: int,
         update_model_state: bool = True,
@@ -635,7 +722,7 @@ class Catan:
         item = _QueueItem(
             app=app,
             unit_id=unit_id,
-            event=event if isinstance(event, scenario.Event) else scenario.Event(event),
+            event=event if isinstance(event, _Event) else _Event(event),
         )
 
         ms_out = self._step(item)
@@ -645,7 +732,7 @@ class Catan:
 
     @staticmethod
     def _run_scenario(
-        app: App, unit_id: int, unit_state: scenario.State, event: scenario.Event
+        app: App, unit_id: int, unit_state: scenario.State, event: _Event
     ) -> scenario.State:
         logger.info("running scenario...")
         context = scenario.Context(
@@ -660,21 +747,21 @@ class Catan:
             unit_id=unit_id,
         )
 
-        if event._is_action_event:  # noqa
-            return context.run_action(event.action, unit_state).state
-        else:
-            return context.run(event, unit_state)
+        # if the event is attached to a unique State object such as a Relation or a Secret, we may
+        # need to re-bind it to the correct one.
+
+        return context.run(event, unit_state)
 
     def _fire(
         self,
         model_state: ModelState,
-        event: scenario.Event,
+        event: _Event,
         app: App,
         unit_id: int,
     ) -> Tuple[ModelState, scenario.State]:
         logger.info(f"firing {event} on {app}:{unit_id}")
         # don't mutate: replace.
-        ms_out = model_state.copy()
+        ms_out = replace(model_state)
         dead_unit = False
 
         try:
@@ -693,10 +780,9 @@ class Catan:
 
         try:
             state_out = self._run_scenario(app, unit_id, state_in, event)
-        except UncaughtCharmError as e:
-            raise ScenarioError(
-                f"Scenario failed emitting {event.name} on {app}/{unit_id}"
-            ) from e
+        except Exception:
+            logger.error(f"Scenario failed emitting {event.name} on {app}/{unit_id}")
+            raise
 
         if not dead_unit:
             units[unit_id] = state_out  # pyright: ignore[reportUnboundVariable]
@@ -709,7 +795,7 @@ class Catan:
 
         def _sync(relation, states: Dict[int, scenario.State]):
             return {
-                uid: s.replace(relations=s.relations + [relation])
+                uid: replace(s, relations=chain(s.relations, [relation]))
                 for uid, s in states.items()
             }
 
@@ -723,7 +809,7 @@ class Catan:
             new_states[b1.app] = _sync(r1, new_states[b1.app])
             new_states[b2.app] = _sync(r2, new_states[b2.app])
 
-        return model_state.replace(unit_states=new_states)
+        return replace(model_state, unit_states=new_states)
 
     def _model_reconcile(
         self, model_state_out: ModelState, app: App, unit_id: int
@@ -780,38 +866,88 @@ class Catan:
     ):
         """Detect secret creation/changes and sync them, while queuing any events."""
         master_state = states_from[unit_id]
-        relation_from, other_relations_from = self._find_relation(
-            master_state, binding_from, binding_to
-        )
+        new_states_to: Dict[int, State] = model_state_out.unit_states[
+            binding_to.app
+        ].copy()
+
         for secret in master_state.secrets:
+            logger.debug(f"syncing secret {secret.id}")
+
             if secret.owner is None:
                 # secret owned by binding_to.app, we can ignore it as it can't have been edited now
                 continue
 
             # secret owned by binding_from.app: it might have been created or edited now
-            for relation_id, readers in secret.remote_grants.items():
+            for readers in secret.remote_grants.values():
                 # readers is a set of remote app or unit names, who have read access to the secret
                 # we need to ensure that this secret is in their states too.
                 for reader in readers:
-                    app_name, _, unit_id_str = reader.rpartition("/")
-                    app = self._get_app(app_name, model_state_out)
-
-                    if unit_id_str:
-                        # secret granted to unit: get that unit state
-                        unit_id = int(unit_id_str)
-                        target_state = model_state_out.unit_states[app][unit_id]
+                    if "/" in reader:
+                        reader_app_name, _, unit_id_str = reader.rpartition("/")
+                        reader_unit_id = int(unit_id_str)
                     else:
-                        # get the leader
-                        unit_id, target_state = [
-                            (i, s)
-                            for i, s in model_state_out.unit_states[app].items()
-                            if s.leader
-                        ][0]
+                        reader_unit_id = None
+                        reader_app_name = reader
 
-                    # if secret in state already, check for changes and update, queue secret-changed
-                    new_target_state = target_state.replace()
+                    if reader_app_name != binding_to.app.name:
+                        # will be handled when reconciling the integration it is granted with
+                        continue
 
-                    # otherwise, add it to the state and queue secret-granted
+                    reader_app = self._get_app(reader_app_name, model_state_out)
+                    logger.debug(f"syncing secrets for remote {reader_app}")
+
+                    affected_reader_units = (
+                        (reader_unit_id,)
+                        # if secret granted to unit: we only update/notify the one unit
+                        if reader_unit_id is not None
+                        else new_states_to.keys()
+                    )
+
+                    for reader_unit_id in affected_reader_units:
+                        target_state = model_state_out.unit_states[reader_app][
+                            reader_unit_id
+                        ]
+
+                        # if the secret is in the state already, check for changes and update, queue secret-changed
+                        reader_secrets = {s.id: s for s in target_state.secrets}
+                        reader_secret = reader_secrets.get(secret.id)
+
+                        changed = False
+                        if reader_secret:
+                            # reader already has the secret
+                            if reader_secret.contents != secret.contents:
+                                reader_secret = reader_secret.replace(
+                                    contents=secret.contents
+                                )
+                                changed = True
+
+                        else:
+                            reader_secret = Secret(
+                                id=secret.id,
+                                tracked_content=secret.tracked_content,
+                            )
+                            changed = True
+
+                        reader_secrets[secret.id] = reader_secret
+
+                        new_target_state = target_state.replace(
+                            secrets=list(reader_secrets.values())
+                        )
+                        new_states_to[reader_unit_id] = new_target_state
+
+                        if queue:
+                            if changed:
+                                self.queue(
+                                    reader_secret.changed_event,
+                                    reader_app,
+                                    # if reader is a unit name, we only fire changed on the one unit,
+                                    # else on all remotes
+                                    reader_unit_id,
+                                )
+                            # todo detect removed, allow simulating rotated, expired...
+
+        # fixme: no mutation!
+        model_state_out.unit_states[binding_to.app] = new_states_to
 
     def _get_app(self, name: str, model_state: Optional[ModelState] = None) -> App:
         for app in (model_state or self._model_state).unit_states:
@@ -909,12 +1045,14 @@ class Catan:
                 remote_rel_from.remote_app_data
                 != relation_from.local_app_data
             ):
-                new_remote_rel_from = remote_rel_from.replace(
+                new_remote_rel_from = replace(
+                    remote_rel_from,
                     remote_units_data=new_remote_units_data,
                     remote_app_data=relation_from.local_app_data,
                 )
-                new_state_to = remote_state.replace(
-                    relations=other_remote_relations_from + [new_remote_rel_from]
+                new_state_to = replace(
+                    remote_state,
+                    relations=other_remote_relations_from + [new_remote_rel_from],
                 )
                 any_changed = new_remote_rel_from
             else:
@@ -924,7 +1062,10 @@ class Catan:
 
         if any_changed and queue:
             # if one has changed, they all have.
-            self.queue(any_changed.changed_event, binding_to.app)
+            self.queue(
+                self.on.relation_changed(any_changed.endpoint, binding_from.app),
+                binding_to.app,
+            )
 
         # fixme: no mutation!
         model_state_out.unit_states[binding_from.app] = new_states_from
@@ -941,9 +1082,7 @@ class Catan:
 
         def _replace_relation(state: scenario.State, relation: scenario.PeerRelation):
             return state.replace(
-                relations=[
-                    r for r in state.relations if r.relation_id != relation.relation_id
-                ]
+                relations=[r for r in state.relations if r.id != relation.id]
                 + [relation]
             )
 
@@ -1005,7 +1144,7 @@ class Catan:
 
             new_unit_states = model_state.unit_states.copy()
             new_unit_states[app] = new_app_unit_states
-            return model_state.replace(unit_states=new_unit_states)
+            return replace(model_state, unit_states=new_unit_states)
 
         ms_current = model_state_out
         for peer_endpoint in app.charm.meta.get("peers", []):
@@ -1074,7 +1213,8 @@ class Catan:
 
             new_integrations.append(
                 Integration(
-                    i.binding1.replace(
+                    replace(
+                        i.binding1,
                         local_app_data=relation_from.local_app_data,
                         remote_app_data=relation_from.remote_app_data,
                         local_units_data={
@@ -1083,7 +1223,8 @@ class Catan:
                         },
                         remote_units_data=relation_from.remote_units_data,
                     ),
-                    i.binding2.replace(
+                    replace(
+                        i.binding2,
                         local_app_data=any_b2_relation.local_app_data,
                         remote_app_data=any_b2_relation.remote_app_data,
                         local_units_data={
@@ -1095,7 +1236,7 @@ class Catan:
                 )
             )
 
-        ms_out = model_state.replace(integrations=new_integrations)
+        ms_out = replace(model_state, integrations=new_integrations)
         self._model_state = ms_out
         return ms_out
 
@@ -1105,25 +1246,28 @@ class Catan:
         This method will NOT validate that the interface you're creating is valid.
         Caller's responsibility.
         """
-        ms_out = self._model_state.replace(
-            integrations=self._model_state.integrations + [integration]
+        ms_out = replace(
+            self._model_state,
+            integrations=self._model_state.integrations + [integration],
         )
+        self._model_state = ms_out
+
         for relation, app, other_app in zip(
             integration.relations, integration.apps, reversed(integration.apps)
         ):
             with self.fixed_sequence():
-                self._queue(ms_out, relation.created_event, app)
+                self.queue(self.on.relation_created(relation.endpoint, other_app), app)
 
                 for remote_unit_id in ms_out.unit_states[other_app]:
-                    self._queue(
-                        ms_out,
-                        relation.joined_event(remote_unit_id=remote_unit_id),
+                    self.queue(
+                        self.on.relation_joined(
+                            relation.endpoint, other_app, remote_unit=remote_unit_id
+                        ),
                         app,
                     )
 
-                self._queue(ms_out, relation.changed_event, app)
+                self.queue(self.on.relation_changed(relation.endpoint, other_app), app)
 
-        self._model_state = ms_out
         return ms_out
 
     def _get_interfaces(
@@ -1186,8 +1330,8 @@ class Catan:
                     )
                 for c in state.containers:
                     self._queue(self._model_state, c.pebble_ready_event, _app, _unit)
-                containers = [c.replace(can_connect=True) for c in state.containers]
-                return state.replace(containers=containers)
+                containers = [replace(c, can_connect=True) for c in state.containers]
+                return replace(state, containers=containers)
 
         new_unit_states = {}
         for _app, unit_states in self._model_state.unit_states.items():
@@ -1206,7 +1350,7 @@ class Catan:
                     }
             new_unit_states[_app] = _new_unit_states_for_app
 
-        ms = self._model_state.replace(unit_states=new_unit_states)
+        ms = replace(self._model_state, unit_states=new_unit_states)
         self._model_state = ms
         return ms
 
@@ -1252,7 +1396,7 @@ class Catan:
                 local_units_data={
                     uid: {} for uid in self.model_state.unit_states[app1]
                 },
-                relation_id=scenario.state.next_relation_id(),
+                id=scenario.state._next_relation_id(),  # noqa
             ),
             Binding(
                 app2,
@@ -1260,7 +1404,7 @@ class Catan:
                 local_units_data={
                     uid: {} for uid in self.model_state.unit_states[app2]
                 },
-                relation_id=scenario.state.next_relation_id(),
+                id=scenario.state._next_relation_id(),  # noqa
             ),
         )
         return self._add_integration(integration)
@@ -1268,6 +1412,12 @@ class Catan:
     def disintegrate(self, integration: Integration) -> ModelState:
         """Remove an integration."""
         model_state = self._model_state
+
+        ms_out = replace(
+            model_state,
+            integrations=[i for i in model_state.integrations if i is not integration],
+        )
+        self._model_state = ms_out
 
         for relation, app, other_app in zip(
             integration.relations, integration.apps, reversed(integration.apps)
@@ -1283,24 +1433,26 @@ class Catan:
             local_units_ids = list(
                 model_state.unit_states.get(app, self._dead_unit_states[app])
             )
+
+            on = CharmEvents()
+
             # do this rather than queuing for the whole app, so we can preserve the internal
             # ordering at the unit level: all that matters is that each unit sees 'broken' after 'departed',
             # but we don't quite care that units start seeing 'broken' only after all 'departed' have been fired.
             for unit_id in local_units_ids:
                 with self.fixed_sequence():
                     for remote_unit_id in departing_units_ids:
-                        self._queue(
-                            model_state,
-                            relation.departed_event(remote_unit_id=remote_unit_id),
+                        self.queue(
+                            on.relation_departed(relation, remote_unit=remote_unit_id),
                             app,
                             unit_id,
                         )
-                    self._queue(model_state, relation.broken_event, app, unit_id)
+                    self.queue(
+                        on.relation_broken(relation),
+                        app,
+                        unit_id,
+                    )
 
-        ms_out = model_state.replace(
-            integrations=[i for i in model_state.integrations if i is not integration]
-        )
-        self._model_state = ms_out
         return ms_out
 
     def get_app(self, name: str) -> App:
@@ -1336,13 +1488,13 @@ class Catan:
 
     def run_action(
         self,
-        action: Union[str, scenario.Action],
+        action: Union[str, _Action],
         app: App,
         unit: Optional[int] = None,
     ):
         """Run an action on all units or a specific one."""
-        if not isinstance(action, scenario.Action):
-            action = scenario.Action(action)
+        if not isinstance(action, _Action):
+            action = _Action(action)
         if app not in self.model_state.unit_states:
             raise InvalidOperationError(
                 f"app {app} not in model state: cannot queue action."
@@ -1352,7 +1504,7 @@ class Catan:
                 f"app {app}/{unit} not in model state: cannot queue action."
             )
 
-        self._queue(self._model_state, cast(scenario.Action, action).event, app, unit)
+        self._queue(self._model_state, cast(_Action, action).event, app, unit)
 
     def _queue_setup_sequence(self, app: App, unit: Optional[int] = None):
         """Queues setup phase event sequence for this app/unit."""
@@ -1377,7 +1529,7 @@ class Catan:
                     relations = self._add_peer_relations(
                         app, peer_id, other_units, base_state.relations
                     )
-                    app_unit_states[peer_id] = base_state.replace(relations=relations)
+                    app_unit_states[peer_id] = replace(base_state, relations=relations)
 
             for _unit in app_unit_states:
                 is_leader = app_unit_states[_unit].leader
@@ -1510,14 +1662,14 @@ class Catan:
 
         if peers:
             if state.leader:
-                # todo consider doing state.replace(leader=False) instead of raising
+                # todo consider doing replace(state,leader=False) instead of raising
                 raise InvalidOperationError("new units cannot join as leaders.")
         else:
             if not state.leader:
                 logger.info(
                     f"new unit {unit_id} is the first unit of {app}: setting leader=True"
                 )
-                state = state.replace(leader=True)
+                state = replace(state, leader=True)
 
         # add any containers
         if self._auto_create_containers_on_deploy:
@@ -1586,9 +1738,7 @@ class Catan:
 
         return integrations
 
-    def _consistency_check(
-        self, cc_output: consistency_checker.Results, operation: str
-    ):
+    def _consistency_check(self, cc_output: Results, operation: str):
         errors, warnings = cc_output
         if errors:
             raise InconsistentStateError(
@@ -1618,7 +1768,7 @@ class Catan:
             new_unit_state = _unit_state.replace(config=config)
 
             self._consistency_check(
-                consistency_checker.check_config_consistency(
+                check_config_consistency(
                     state=new_unit_state,
                     charm_spec=app.charm,
                     juju_version=JUJU_VERSION,
@@ -1962,3 +2112,10 @@ class Catan:
         if len(leaders) > 1:
             raise InconsistentStateError(f"{app} has too many leaders")
         return leaders[0]
+
+    def _get_relation(self, app: App, endpoint: str, other: App):
+        """Get the relation involving app:endpoint --> other"""
+        integration = self.get_integration(app, endpoint, other)
+        if integration.binding1.app is app:
+            return integration.relations[0]
+        return integration.relations[1]
